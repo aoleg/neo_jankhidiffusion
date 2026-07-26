@@ -91,8 +91,8 @@ Advanced with blocks 3/5, End 0.45, and CA off — that is the configuration ver
 
 RAUNet is much better behaved under **Euler Dy**, **Euler Dy CFG++**, **Euler SMEA Dy**
 and relatives (from
-[sd-forge-extra-samplers](https://github.com/MisterChief95/sd-forge-extra-samplers) and 
-[Neo_ExtraSchedulers](https://github.com/aoleg/Neo_ExtraSchedulers) than under
+[sd-forge-extra-samplers](https://github.com/MisterChief95/sd-forge-extra-samplers) and
+[Neo_ExtraSchedulers](https://github.com/aoleg/Neo_ExtraSchedulers)) than under
 plain samplers. The mechanism is not mysterious: those samplers take an extra denoising
 sub-step on a *half-resolution* latent early in the schedule, which locks the composition
 in at something near the model's native scale — the same problem RAUNet is solving, from
