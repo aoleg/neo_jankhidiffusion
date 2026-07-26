@@ -1,0 +1,525 @@
+"""RAUNet for WebUI Forge Neo — a port of blepping's `comfyui_jankhidiffusion`.
+
+Base choice: the **ComfyUI** node, not the older reForge script.  Neo's UNet keeps
+ComfyUI's extension surface almost verbatim (`input_block_patch`, `output_block_patch`,
+`add_object_patch`, `transformer_options["sigmas"]`), so the maintained upstream ports
+across with less adaptation than the reForge fork needed — and it brings several years of
+fixes the fork predates: the cross-attention fadeout, fractional downscale factors,
+`adaptive_avg_pool2d`, per-clone state instead of a global singleton, and SDXL presets
+that agree with themselves.  The reForge script contributed the UI shape only.
+
+Three things here are Forge-specific rather than ported:
+
+* **The resolution gate.**  In ComfyUI you wire RAUNet into one KSampler.  In a webui the
+  patched UNet is reused by every pass of the run, so with Hires. fix on, an unguarded
+  RAUNet also mangles the low-resolution first pass — the pass it is supposed to leave
+  alone.  The gate skips the effect whenever the latent being denoised is at or below the
+  model's native resolution, which fixes that and, as a side effect, keeps RAUNet out of
+  the half-resolution sub-steps that Euler Dy and friends take.
+* **The sampler note.**  See the README; RAUNet is much better behaved under the Dy /
+  CFG++ family, and if the settings are aggressive on a plain sampler it says so once.
+* **XYZ axes and infotext**, as usual for a webui script.
+"""
+
+import re
+
+import gradio as gr
+from modules import scripts
+from modules.processing import logger
+from modules.ui_components import InputAccordion
+
+from lib_jankhidiffusion import unet_map as maps
+from lib_jankhidiffusion import xyz
+from lib_jankhidiffusion.controlnet import install as install_controlnet_shim
+from lib_jankhidiffusion.raunet import Config, apply_raunet
+from lib_jankhidiffusion.utils import DOWNSCALE_METHODS, TWO_STAGE_METHODS, UPSCALE_METHODS
+
+SIMPLE = "Simple"
+ADVANCED = "Advanced"
+MODES = [SIMPLE, ADVANCED]
+
+TIME_MODES = ["percent", "timestep", "sigma"]
+FAMILIES = [str(family) for family in maps.ModelFamily]
+
+#   Samplers that take an extra denoising sub-step on a rescaled latent. They interact
+#   unusually well with RAUNet - see README, "Samplers".  Matched as whole words, so a
+#   future sampler with "dy" buried in its name is not mistaken for one.
+DY_MARKERS = frozenset({"dy", "smea"})
+
+
+def _is_dy_sampler(name: str) -> bool:
+    return bool(DY_MARKERS & set(re.split(r"[^a-z0-9+]+", (name or "").lower())))
+
+
+#   Native resolution, times a little headroom, is the gate threshold. 1024x1024 SDXL is
+#   1.05MP, so 1.1x keeps "exactly native" on the skip side without excluding 1152x896.
+AUTO_GATE_HEADROOM = 1.1
+
+#   The four time sliders mean different things per time mode, and 0-1 is only right for
+#   one of them: timesteps run 0-999 and sigma tops out around 14.6 on an SD schedule.
+TIME_RANGES = {"percent": (1.0, 0.01), "timestep": (999.0, 1.0), "sigma": (20.0, 0.05)}
+
+
+class NeoRAUNet(scripts.Script):
+    sorting_priority = 16.05
+
+    #   class attributes: `process_before_every_sampling` returns long before the patches
+    #   run, and `postprocess` is not guaranteed to see the same instance
+    xyz_cache: dict = {}
+    active: bool = False
+    configs: list = []
+    #   the UI arguments *after* X/Y/Z overrides.  `process` is where the axis cache can
+    #   be read and cleared (it runs once per grid cell, before any sampling), so the
+    #   resolved values have to be carried forward rather than re-derived per pass.
+    resolved: dict = {}
+
+    def title(self):
+        return "RAUNet (Neo)"
+
+    def show(self, is_img2img):
+        return scripts.AlwaysVisible
+
+    # ------------------------------------------------------------------------ UI ----
+
+    def ui(self, is_img2img):
+        with InputAccordion(False, label=self.title()) as enable:
+            gr.Markdown("Generate above a model's native resolution with fewer duplicated subjects and less mush. SD1.x / SD2.x / SDXL only — this rewrites UNet scaling blocks, which DiT models (Flux, Qwen, Krea 2) do not have.")
+
+            mode = gr.Radio(value=SIMPLE, choices=MODES, label="Mode", info="Simple picks a preset for the model and resolution; Advanced exposes every knob")
+
+            with gr.Group() as g_simple:
+                with gr.Row():
+                    model_type = gr.Dropdown(value="auto", choices=["auto", *FAMILIES], label="Model type", info="auto reads it from the loaded checkpoint; choose SD15 for SD 1.4 / 2.x")
+                    res_mode = gr.Dropdown(value=maps.RES_MODES[1], choices=list(maps.RES_MODES), label="Resolution mode", info="a preset band, not a match against your actual size")
+                with gr.Row():
+                    simple_upscale_mode = gr.Dropdown(value="default", choices=["default", *UPSCALE_METHODS], label="Upscale mode")
+                    simple_ca_upscale_mode = gr.Dropdown(value="default", choices=["default", *UPSCALE_METHODS], label="CA upscale mode")
+
+            with gr.Group(visible=False) as g_advanced:
+                with gr.Row():
+                    input_blocks = gr.Textbox(value="3", label="Input blocks", info="comma-separated Downsample blocks")
+                    output_blocks = gr.Textbox(value="8", label="Output blocks", info="the matching Upsample blocks")
+                gr.Markdown("Pairings — SD1.5: input 3 with output 8, 6 with 5, 9 with 2. SDXL: input 3 with output 5, 6 with 2. HiDiffusion's own SDXL setting is 6/2; 3/5 is gentler.")
+
+                time_mode = gr.Dropdown(value="percent", choices=TIME_MODES, label="Time mode", info="how the start/end values below are read; use percent unless you know otherwise")
+                with gr.Row():
+                    start_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="Start")
+                    end_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.45, label="End", info="past this point the model runs unmodified")
+                with gr.Row():
+                    upscale_mode = gr.Dropdown(value="bicubic", choices=list(UPSCALE_METHODS), label="Upscale mode", info="bicubic or bislerp")
+                    two_stage_upscale_mode = gr.Dropdown(value="disabled", choices=list(TWO_STAGE_METHODS), label="Two-stage upscale", info="do half the upscale with this mode first; different, not necessarily better")
+
+                with gr.Accordion(open=True, label="Cross-attention"):
+                    with gr.Row():
+                        ca_input_blocks = gr.Textbox(value="4", label="CA input blocks")
+                        ca_output_blocks = gr.Textbox(value="8", label="CA output blocks")
+                    with gr.Row():
+                        ca_start_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="CA start")
+                        ca_end_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.3, label="CA end")
+                    with gr.Row():
+                        ca_downscale_factor = gr.Slider(minimum=1.0, maximum=4.0, step=0.05, value=2.0, label="CA downscale factor", info="2.0 = half size; fractional values need adaptive_avg_pool2d")
+                        ca_downscale_mode = gr.Dropdown(value="adaptive_avg_pool2d", choices=list(DOWNSCALE_METHODS), label="CA downscale mode", info="avg_pool2d is stock HiDiffusion; adaptive_avg_pool2d matches it and allows fractional factors")
+                        ca_ca_upscale_mode = gr.Dropdown(value="bicubic", choices=list(UPSCALE_METHODS), label="CA upscale mode")
+                    with gr.Row():
+                        ca_fadeout_start_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="CA fadeout start", info="taper the downscale from here to CA end instead of cutting it off; 0 disables. The single most useful setting if the image falls apart when the effect ends")
+                        ca_fadeout_cap = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="CA fadeout floor", info="how much of the effect survives the taper")
+                    ca_input_after_skip_mode = gr.Checkbox(value=False, label="Patch input blocks after the skip connection", info="the skip connection keeps the original resolution; changes the effect noticeably")
+
+                yaml_parameters = gr.Textbox(value="", lines=3, label="Extra parameters (YAML)", info="overrides any Config field by name — pre/post scale multipliers, ca_downscale_factor_w, ca_avg_pool2d_ceil_mode, verbose")
+
+            with gr.Row():
+                auto_gate = gr.Checkbox(value=True, label="Skip at or below native resolution", info="leaves the Hires. fix first pass and the rescaled sub-steps of Dy samplers alone")
+                min_megapixels = gr.Slider(minimum=0.0, maximum=8.0, step=0.05, value=0.0, label="…or skip below (MP)", info="used when the checkbox above is off; 0 = always apply")
+            apply_to_hr = gr.Checkbox(value=True, label="Apply to the Hires. fix pass")
+
+        mode.change(
+            fn=lambda chosen: [gr.update(visible=chosen == SIMPLE), gr.update(visible=chosen == ADVANCED)],
+            inputs=[mode],
+            outputs=[g_simple, g_advanced],
+            show_progress=False,
+        )
+
+        #   Advanced defaults follow whichever family the Simple tab is pointed at, so the
+        #   two tabs never disagree the way the reForge script's did.
+        advanced_targets = [input_blocks, output_blocks, ca_input_blocks, ca_output_blocks, start_time, end_time, ca_start_time, ca_end_time]
+        model_type.change(fn=self._advanced_defaults, inputs=[model_type, res_mode], outputs=advanced_targets, show_progress=False)
+        res_mode.change(fn=self._advanced_defaults, inputs=[model_type, res_mode], outputs=advanced_targets, show_progress=False)
+
+        time_sliders = [start_time, end_time, ca_start_time, ca_end_time, ca_fadeout_start_time]
+        time_mode.change(fn=self._time_ranges, inputs=[time_mode], outputs=time_sliders, show_progress=False)
+
+        self.infotext_fields = [
+            (enable, lambda d: "RAUNet mode" in d),
+            (mode, "RAUNet mode"),
+            (model_type, "RAUNet model type"),
+            (res_mode, "RAUNet res mode"),
+            (simple_upscale_mode, "RAUNet simple upscale"),
+            (simple_ca_upscale_mode, "RAUNet simple CA upscale"),
+            (input_blocks, "RAUNet input blocks"),
+            (output_blocks, "RAUNet output blocks"),
+            (time_mode, "RAUNet time mode"),
+            (start_time, "RAUNet start"),
+            (end_time, "RAUNet end"),
+            (upscale_mode, "RAUNet upscale"),
+            (two_stage_upscale_mode, "RAUNet two-stage upscale"),
+            (ca_input_blocks, "RAUNet CA input blocks"),
+            (ca_output_blocks, "RAUNet CA output blocks"),
+            (ca_start_time, "RAUNet CA start"),
+            (ca_end_time, "RAUNet CA end"),
+            (ca_downscale_factor, "RAUNet CA downscale factor"),
+            (ca_downscale_mode, "RAUNet CA downscale"),
+            (ca_ca_upscale_mode, "RAUNet CA upscale"),
+            (ca_fadeout_start_time, "RAUNet CA fadeout start"),
+            (ca_fadeout_cap, "RAUNet CA fadeout floor"),
+            (ca_input_after_skip_mode, "RAUNet CA after skip"),
+            (auto_gate, "RAUNet auto gate"),
+            (min_megapixels, "RAUNet min MP"),
+        ]
+
+        components = [
+            enable,
+            mode,
+            model_type,
+            res_mode,
+            simple_upscale_mode,
+            simple_ca_upscale_mode,
+            input_blocks,
+            output_blocks,
+            time_mode,
+            start_time,
+            end_time,
+            upscale_mode,
+            two_stage_upscale_mode,
+            ca_input_blocks,
+            ca_output_blocks,
+            ca_start_time,
+            ca_end_time,
+            ca_downscale_factor,
+            ca_downscale_mode,
+            ca_ca_upscale_mode,
+            ca_fadeout_start_time,
+            ca_fadeout_cap,
+            ca_input_after_skip_mode,
+            yaml_parameters,
+            auto_gate,
+            min_megapixels,
+            apply_to_hr,
+        ]
+
+        xyz.register(NeoRAUNet.xyz_cache, UPSCALE_METHODS, DOWNSCALE_METHODS, maps.RES_MODES, FAMILIES)
+        return components
+
+    @staticmethod
+    def _time_ranges(time_mode):
+        """Widen the time sliders when they stop meaning percentages."""
+
+        maximum, step = TIME_RANGES.get(str(time_mode), TIME_RANGES["percent"])
+        return [gr.update(maximum=maximum, step=step) for _ in range(5)]
+
+    @staticmethod
+    def _advanced_defaults(model_type, res_mode):
+        """Fill the Advanced fields from the preset the Simple tab is showing."""
+
+        family = maps.ModelFamily.SDXL if model_type == "auto" else maps.ModelFamily(model_type)
+        preset = maps.PRESETS[family]
+        window = preset.res_modes.get(maps.res_mode_key(res_mode)) or (1.0, 1.0, 1.0, 1.0)
+        start, end, ca_start, ca_end = window
+        return [
+            gr.update(value=preset.input_blocks),
+            gr.update(value=preset.output_blocks),
+            gr.update(value=preset.ca_input_blocks),
+            gr.update(value=preset.ca_output_blocks),
+            gr.update(value=start),
+            gr.update(value=end),
+            gr.update(value=ca_start),
+            gr.update(value=ca_end),
+        ]
+
+    # ------------------------------------------------------------- arg plumbing ----
+
+    @staticmethod
+    def _named_args(args) -> dict:
+        keys = (
+            "mode",
+            "model_type",
+            "res_mode",
+            "simple_upscale_mode",
+            "simple_ca_upscale_mode",
+            "input_blocks",
+            "output_blocks",
+            "time_mode",
+            "start_time",
+            "end_time",
+            "upscale_mode",
+            "two_stage_upscale_mode",
+            "ca_input_blocks",
+            "ca_output_blocks",
+            "ca_start_time",
+            "ca_end_time",
+            "ca_downscale_factor",
+            "ca_downscale_mode",
+            "ca_ca_upscale_mode",
+            "ca_fadeout_start_time",
+            "ca_fadeout_cap",
+            "ca_input_after_skip_mode",
+            "yaml_parameters",
+            "auto_gate",
+            "min_megapixels",
+            "apply_to_hr",
+        )
+        return dict(zip(keys, args, strict=True))
+
+    @classmethod
+    def _apply_xyz(cls, enable: bool, ui: dict) -> bool:
+        for field, value in cls.xyz_cache.items():
+            if field == "enable":
+                enable = str(value).lower() not in ("false", "0", "none", "")
+            elif field == "mode":
+                ui["mode"] = value
+            elif field in ui:
+                ui[field] = value
+        cls.xyz_cache.clear()
+        return enable
+
+    @staticmethod
+    def _settings(ui: dict, family: maps.ModelFamily | None) -> dict | None:
+        """UI arguments -> the keyword arguments `Config.build` takes.
+
+        Simple mode is a preset lookup that then goes through the exact same path as
+        Advanced, so there is only one code path to be wrong about.
+        """
+
+        if ui["mode"] == SIMPLE:
+            chosen = ui["model_type"]
+            if chosen != "auto":
+                family = maps.ModelFamily(chosen)
+            if family is None:
+                logger.warning("RAUNet: could not identify the model family; pick one explicitly in the Simple tab")
+                return None
+
+            preset = maps.PRESETS[family]
+            key = maps.res_mode_key(ui["res_mode"])
+            window = preset.res_modes.get(key)
+            if window is None:
+                logger.warning(f"RAUNet: no preset for {family} / {key}")
+                return None
+            if not window:
+                logger.info(f"RAUNet: the {family} '{key}' preset is a no-op; that resolution is native for this model")
+                return None
+
+            #   `start >= end` is upstream's way of saying "this half is off"; blank the
+            #   block lists rather than relying on an empty sigma window to do it, so the
+            #   log line and the infotext both read the way the preset means
+            start, end, ca_start, ca_end = window
+            main_enabled = start < end
+            ca_enabled = ca_start < ca_end
+            return {
+                "input_blocks": preset.input_blocks if main_enabled else "",
+                "output_blocks": preset.output_blocks if main_enabled else "",
+                "ca_input_blocks": preset.ca_input_blocks if ca_enabled else "",
+                "ca_output_blocks": preset.ca_output_blocks if ca_enabled else "",
+                "time_mode": "percent",
+                "start_time": start,
+                "end_time": end,
+                "ca_start_time": ca_start,
+                "ca_end_time": ca_end,
+                "upscale_mode": "bicubic" if ui["simple_upscale_mode"] == "default" else ui["simple_upscale_mode"],
+                "ca_upscale_mode": "bicubic" if ui["simple_ca_upscale_mode"] == "default" else ui["simple_ca_upscale_mode"],
+            }
+
+        fadeout = float(ui["ca_fadeout_start_time"])
+        return {
+            "input_blocks": ui["input_blocks"],
+            "output_blocks": ui["output_blocks"],
+            "ca_input_blocks": ui["ca_input_blocks"],
+            "ca_output_blocks": ui["ca_output_blocks"],
+            "time_mode": ui["time_mode"],
+            "start_time": float(ui["start_time"]),
+            "end_time": float(ui["end_time"]),
+            "ca_start_time": float(ui["ca_start_time"]),
+            "ca_end_time": float(ui["ca_end_time"]),
+            "ca_fadeout_start_time": fadeout if fadeout > 0.0 else None,
+            "ca_fadeout_cap": float(ui["ca_fadeout_cap"]),
+            "upscale_mode": ui["upscale_mode"],
+            "two_stage_upscale_mode": ui["two_stage_upscale_mode"],
+            "ca_upscale_mode": ui["ca_ca_upscale_mode"],
+            "ca_downscale_mode": ui["ca_downscale_mode"],
+            "ca_downscale_factor": float(ui["ca_downscale_factor"]),
+            "ca_input_after_skip_mode": bool(ui["ca_input_after_skip_mode"]),
+        }
+
+    @staticmethod
+    def _merge_yaml(settings: dict, raw: str) -> dict:
+        if not raw or not raw.strip():
+            return settings
+        import yaml
+
+        extra = yaml.safe_load(raw)
+        if extra is None:
+            return settings
+        if not isinstance(extra, dict):
+            raise ValueError("Extra parameters must be a YAML mapping (key: value), or empty")
+        return {**settings, **extra}
+
+    # ----------------------------------------------------------------- hooks ----
+
+    def process(self, p, enable, *args):
+        cls = NeoRAUNet
+        cls.active = False
+        cls.configs = []
+        cls.resolved = {}
+
+        ui = self._named_args(args)
+        enable = cls._apply_xyz(bool(enable), ui)
+        if not enable:
+            return
+        cls.resolved = ui
+
+        params = {"RAUNet mode": ui["mode"]}
+        if ui["mode"] == SIMPLE:
+            params.update(
+                {
+                    "RAUNet model type": ui["model_type"],
+                    "RAUNet res mode": ui["res_mode"],
+                    "RAUNet simple upscale": ui["simple_upscale_mode"],
+                    "RAUNet simple CA upscale": ui["simple_ca_upscale_mode"],
+                }
+            )
+        else:
+            params.update(
+                {
+                    "RAUNet input blocks": ui["input_blocks"],
+                    "RAUNet output blocks": ui["output_blocks"],
+                    "RAUNet time mode": ui["time_mode"],
+                    "RAUNet start": ui["start_time"],
+                    "RAUNet end": ui["end_time"],
+                    "RAUNet upscale": ui["upscale_mode"],
+                    "RAUNet CA input blocks": ui["ca_input_blocks"],
+                    "RAUNet CA output blocks": ui["ca_output_blocks"],
+                    "RAUNet CA start": ui["ca_start_time"],
+                    "RAUNet CA end": ui["ca_end_time"],
+                    "RAUNet CA downscale factor": ui["ca_downscale_factor"],
+                    "RAUNet CA downscale": ui["ca_downscale_mode"],
+                    "RAUNet CA upscale": ui["ca_ca_upscale_mode"],
+                }
+            )
+            if ui["two_stage_upscale_mode"] != "disabled":
+                params["RAUNet two-stage upscale"] = ui["two_stage_upscale_mode"]
+            if float(ui["ca_fadeout_start_time"]) > 0.0:
+                params["RAUNet CA fadeout start"] = ui["ca_fadeout_start_time"]
+                params["RAUNet CA fadeout floor"] = ui["ca_fadeout_cap"]
+            if ui["ca_input_after_skip_mode"]:
+                params["RAUNet CA after skip"] = True
+
+        params["RAUNet auto gate"] = bool(ui["auto_gate"])
+        if not ui["auto_gate"] and float(ui["min_megapixels"]) > 0.0:
+            params["RAUNet min MP"] = ui["min_megapixels"]
+
+        p.extra_generation_params.update(params)
+        NeoRAUNet.active = True
+
+    def process_before_every_sampling(self, p, enable, *args, **kwargs):
+        cls = NeoRAUNet
+        if not cls.active or not cls.resolved:
+            return
+
+        ui = cls.resolved
+        is_hr = bool(getattr(p, "is_hr_pass", False))
+        if is_hr and not ui["apply_to_hr"]:
+            return
+
+        unet = p.sd_model.forge_objects.unet.clone()
+        unet_map, family = maps.describe(unet, getattr(p, "sd_model", None))
+        if not unet_map.supported:
+            logger.warning(f"RAUNet: not applied - {unet_map.reason}")
+            return
+
+        if ui["model_type"] != "auto":
+            family = maps.ModelFamily(ui["model_type"])
+
+        settings = self._settings(ui, family)
+        if settings is None:
+            return
+
+        try:
+            settings = self._merge_yaml(settings, ui["yaml_parameters"])
+            settings["min_megapixels"] = self._gate_threshold(ui, family)
+            config = Config.build(unet.get_model_object("predictor"), **settings)
+            if not config.use_blocks and not config.ca_use_blocks:
+                logger.info("RAUNet: no blocks selected, nothing to do")
+                return
+            apply_raunet(unet, config, unet_map)
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.error(f"RAUNet: not applied - {exc}")
+            return
+
+        install_controlnet_shim()
+        p.sd_model.forge_objects.unet = unet
+        cls.configs.append(config)
+
+        self._report(p, settings, config, family, unet_map, is_hr)
+
+    @staticmethod
+    def _gate_threshold(ui: dict, family) -> float:
+        if not ui["auto_gate"]:
+            return float(ui["min_megapixels"])
+        preset = maps.PRESETS.get(family)
+        if preset is None:
+            return 0.0
+        return round(preset.native_megapixels * AUTO_GATE_HEADROOM, 4)
+
+    @staticmethod
+    def _report(p, settings: dict, config: Config, family, unet_map, is_hr: bool) -> None:
+        pass_name = "hires pass" if is_hr else "first pass"
+        blocks = ", ".join(f"{t}{i}" for t, i in sorted(config.use_blocks)) or "none"
+        ca_blocks = ", ".join(f"{t}{i}" for t, i in sorted(config.ca_use_blocks)) or "none"
+        logger.info(
+            f"RAUNet [{pass_name}]: {family or 'unknown model'}, blocks [{blocks}] sigma {config.start_sigma:.4g}->{config.end_sigma:.4g}"
+            f" | CA [{ca_blocks}] sigma {config.ca_start_sigma:.4g}->{config.ca_end_sigma:.4g} x{config.ca_downscale_factor:g} {config.ca_downscale_mode}"
+            f" | skip below {config.min_megapixels:g}MP"
+        )
+
+        for note in unet_map.advise_ca(config.ca_use_blocks, after_skip=config.ca_input_after_skip_mode):
+            logger.warning(f"RAUNet: {note}")
+
+        sampler = (getattr(p, "hr_sampler_name", None) if is_hr else None) or getattr(p, "sampler_name", "") or ""
+        if _is_dy_sampler(sampler):
+            return
+        if str(settings.get("time_mode", "percent")) != "percent":
+            return
+
+        #   Both halves of the effect stop dead at their end percent, and everything after
+        #   that runs on a latent built under different geometry.  The later the cutoff and
+        #   the harder the transition, the more that shows — which is the mechanism behind
+        #   "it falls apart with normal samplers".  Only nag when the settings are in that
+        #   territory, and say what to change.
+        cutoffs = []
+        if config.use_blocks:
+            cutoffs.append(float(settings.get("end_time", 0.0)))
+        if config.ca_use_blocks and not settings.get("ca_fadeout_start_time"):
+            cutoffs.append(float(settings.get("ca_end_time", 0.0)))
+        if cutoffs and max(cutoffs) >= 0.4:
+            logger.info(f"RAUNet: '{sampler}' is not one of the Dy / SMEA samplers, whose rescaled sub-steps ride out the end of the RAUNet window much better. If the image degrades, lower End / CA end or set a CA fadeout start.")
+
+    def postprocess(self, p, processed, *args):
+        cls = NeoRAUNet
+
+        #   `process` writes the infotext before anything is known about the model, so a
+        #   run that turned out to be unpatchable (DiT checkpoint, invalid blocks, a
+        #   no-op preset) would otherwise ship parameters claiming an effect that never
+        #   ran.  Take them back out rather than lie in the PNG metadata.
+        if cls.active and not cls.configs:
+            for key in [k for k in p.extra_generation_params if k.startswith("RAUNet ")]:
+                p.extra_generation_params.pop(key, None)
+
+        for config in cls.configs:
+            if config.hits_main == 0 and config.hits_ca == 0:
+                reason = "the start/end windows excluded every step"
+                if config.skips_resolution:
+                    reason = f"the resolution gate skipped all {config.skips_resolution} forward passes (image is at or below native resolution)"
+                logger.warning(f"RAUNet was enabled but never modified a step: {reason}")
+            elif config.skips_resolution:
+                logger.debug(f"RAUNet: {config.hits_main} scaling-block hits, {config.hits_ca} cross-attention hits, {config.skips_resolution} passes skipped by the resolution gate")
+        cls.configs = []
+        cls.active = False
+        cls.resolved = {}

@@ -1,0 +1,246 @@
+# RAUNet for WebUI Forge Neo
+
+A port of [blepping's `comfyui_jankhidiffusion`](https://github.com/blepping/comfyui_jankhidiffusion)
+(RAUNet, from [HiDiffusion](https://hidiffusion.github.io/)) to
+[sd-webui-forge-classic](https://github.com/Haoming02/sd-webui-forge-classic) (Neo branch).
+
+RAUNet lets a UNet model generate well above the resolution it was trained for with far
+fewer duplicated subjects, repeated limbs and general mush. It does this by temporarily
+changing where the UNet's resolution pyramid sits, for the first part of sampling only.
+
+**Supports SD 1.x, SD 2.x and SDXL.** It does not support DiT models (Flux, Qwen, Chroma,
+Krea 2) — see [Other model families](#other-model-families).
+
+## Install
+
+Clone into `extensions/`:
+
+```bash
+git clone https://github.com/<you>/neo_jankhidiffusion extensions/neo_jankhidiffusion
+```
+
+Restart the webui. The panel appears as **RAUNet (Neo)** in txt2img and img2img.
+
+## What it actually does
+
+Two independent effects, each with its own start/end window:
+
+**Scaling blocks.** One `Downsample` block on the way down runs its 3×3 convolution with
+stride 4 / dilation 2 / padding 2 instead of stride 2, halving the feature map a second
+time; the mirrored `Upsample` block compensates with a 4× interpolation. In between, the
+deep layers of the UNet see feature maps the size they were trained on. This is the big,
+structural half of the effect.
+
+**Cross-attention.** A shallower pair of blocks has its hidden state pooled down before
+attention and scaled back up afterwards. Gentler, and often the only half you want.
+
+Both stop at their end percentage, after which the model runs completely unmodified.
+
+## Quick start
+
+Leave **Mode** on *Simple*, set **Resolution mode** to the band you are generating in, and
+generate. `Model type: auto` reads the family from the loaded checkpoint.
+
+| Model | Resolution mode | What the preset does |
+|---|---|---|
+| SD1.5 | low | scaling blocks 0–40% |
+| SD1.5 | high | scaling blocks 0–50%, cross-attention 0–35% |
+| SD1.5 | ultra | scaling blocks 0–60%, cross-attention 0–45% |
+| SDXL | low | **nothing** — 1024×1024 is native, there is nothing to fix |
+| SDXL | high | cross-attention 0–50% only |
+| SDXL | ultra | scaling blocks 0–45%, cross-attention 0–60% |
+
+Resolution mode is a preset band, not a check against your actual size — picking `ultra`
+at 1536² is a legitimate thing to do if you want a stronger effect.
+
+### Note on the SDXL presets
+
+These are upstream's numbers, and for SDXL they differ sharply from the older reForge
+port's:
+
+| | scaling blocks | cross-attention |
+|---|---|---|
+| reForge, SDXL high | 0–50% | off |
+| ComfyUI (and here), SDXL high | **off** | **0–50%** |
+
+The two are close to inverted. Upstream's conclusion is that the Downsample/Upsample
+rewrite is the part that hurts SDXL in the 1536–2048 band, and only the cross-attention
+rescale should be on there; the fork enables exactly the half upstream turned off. If your
+memory of RAUNet on SDXL is "it falls apart quickly", that is a likely reason, and the
+Simple presets here will behave noticeably differently.
+
+## Samplers
+
+RAUNet is much better behaved under **Euler Dy**, **Euler Dy CFG++**, **Euler SMEA Dy**
+and relatives (from
+[sd-forge-extra-samplers](https://github.com/Haoming02/sd-forge-extra-samplers)) than under
+plain samplers. The mechanism is not mysterious: those samplers take an extra denoising
+sub-step on a *half-resolution* latent early in the schedule, which locks the composition
+in at something near the model's native scale — the same problem RAUNet is solving, from
+the other end. Ordinary samplers get no such help, and the abrupt end of the RAUNet window
+lands on them undamped.
+
+Rather than build sampler logic into this extension, the fixes for that live where the
+problem is:
+
+* **CA fadeout start** (Advanced → Cross-attention). Tapers the downscale factor smoothly
+  from that point to CA end instead of cutting it off. This is the single most effective
+  setting if the image degrades as the effect ends, and it is the main thing the older
+  reForge port did not have. Try a fadeout start around 60–70% of the way through the CA
+  window.
+* **Lower End / CA end.** A cutoff at 45% is much easier to absorb than one at 60%.
+* **The resolution gate** (below) keeps RAUNet out of the Dy samplers' rescaled sub-steps,
+  where it would otherwise be correcting a latent that is already at native resolution.
+
+If you enable RAUNet with a late cutoff on a non-Dy sampler, the log says so once, with
+these suggestions. It never changes your settings.
+
+## The resolution gate
+
+`Skip at or below native resolution` is checked by default and has no upstream equivalent
+— it exists because a webui is not ComfyUI.
+
+In ComfyUI you wire RAUNet into one KSampler and it affects that sampler only. In Forge the
+patched UNet is used by every pass of the run, so with **Hires. fix** on, an unguarded
+RAUNet also runs during the low-resolution *first* pass — the pass that does not need it
+and is actively harmed by it. The gate measures the latent at the start of each forward and
+skips the whole effect when the image is at or below the model's native resolution
+(SDXL 1.05 MP × 1.1 headroom; SD1.5 0.26 MP × 1.1).
+
+Consequences worth knowing:
+
+* With Hires. fix, RAUNet effectively becomes "hires pass only" without you configuring
+  anything, which is almost always what you want.
+* During a Dy sampler's half-resolution sub-step, the gate suppresses RAUNet. This is
+  correct — that sub-step is already at native scale — but it is a behaviour change versus
+  the reForge port. Uncheck the box to get the old behaviour.
+* If the gate suppresses *every* pass, the log says so at the end of the generation rather
+  than leaving you wondering why nothing changed.
+
+Uncheck it to use the manual **…or skip below (MP)** slider instead; 0 there means "always
+apply".
+
+## Advanced settings
+
+**Input blocks / Output blocks** — the scaling-block pair, comma separated. They must be
+paired or the UNet's skip connections will not line up; the extension refuses obviously
+wrong combinations with an explanation rather than letting torch fail deep inside a
+forward pass.
+
+| Model | valid pairs |
+|---|---|
+| SD1.5 / SD2.x | 3↔8, 6↔5, 9↔2 |
+| SDXL | 3↔5, 6↔2 |
+
+HiDiffusion's own SDXL setting is 6/2; 3/5 is the gentler one and is what the presets use.
+
+**Time mode** — `percent` (of the step progression), `timestep` (0–999, inverted) or
+`sigma` (raw). The sliders re-range themselves when you switch. Use percent unless you have
+a reason not to.
+
+**Upscale mode** — how the Upsample block interpolates. `bicubic` or `bislerp`.
+
+**Two-stage upscale** — do half the upscale with a second method first. Different, not
+necessarily better; upstream defaults it off and so does this.
+
+**CA input / output blocks** — the cross-attention pair. The pairing rule is
+`output = n_output_blocks - input` (SDXL 4↔5, SD1.5 1↔11), and it shifts by one in
+after-skip mode. A wrong pairing raises a `torch.cat` size error deep in the UNet, so the
+extension checks it and names the block it expected.
+
+**CA downscale factor / mode** — 2.0 means half size. `avg_pool2d` is stock HiDiffusion
+and only accepts whole numbers; `adaptive_avg_pool2d` matches it for whole numbers and also
+allows fractional factors, which is how you get an effect gentler than "half".
+
+**CA fadeout start / floor** — see [Samplers](#samplers). 0 disables the fade.
+
+**Patch input blocks after the skip connection** — moves the cross-attention downscale to
+the far side of the skip push, so the skip keeps full resolution. Changes the effect
+noticeably, and shifts the CA block pairing by one.
+
+**Extra parameters (YAML)** — a mapping that overrides any field of the internal `Config`
+by name. Useful ones: `pre_upscale_multiplier`, `post_upscale_multiplier`,
+`pre_downscale_multiplier`, `post_downscale_multiplier` and their `ca_` counterparts,
+`ca_downscale_factor_w` (a separate horizontal factor), `ca_avg_pool2d_ceil_mode`,
+`ca_latent_pixel_increment`, `verbose: true`.
+
+```yaml
+ca_downscale_factor_w: 1.5
+ca_post_upscale_multiplier: 1.02
+verbose: true
+```
+
+There is very little error checking on this path — it is the escape hatch, by design.
+
+## ControlNet
+
+ControlNet hints are computed against unmodified UNet geometry, so once RAUNet has changed
+a feature map's resolution they no longer line up. Neo's stock `apply_control` catches the
+resulting error, prints a warning and drops the hint. On first use this extension replaces
+it with a version that resizes the hint instead. The replacement is behaviour-identical
+when shapes already match, and is left installed afterwards. Set
+`JANKHIDIFFUSION_NO_CONTROLNET_WORKAROUND=1` in the environment to opt out.
+
+## X/Y/Z Plot
+
+Twenty axes are registered under `[RAUNet] …` — Enable, Mode, Model type, Resolution mode,
+the block lists, all the time windows, the fadeout, the downscale factor and mode, both
+upscale modes, and Min megapixels.
+
+## Other model families
+
+`inspect_unet` walks the loaded model rather than trusting a hard-coded table, so an
+unsupported checkpoint gets a clear log line instead of a crash:
+
+```
+RAUNet: not applied - SingleStreamDiT is not a UNet (no input_blocks/output_blocks);
+RAUNet needs a down/up resolution pyramid
+```
+
+**Krea 2 specifically** is a `SingleStreamDiT` (`backend/nn/krea.py`) — a flat stack of
+single-stream transformer blocks with no resolution pyramid, no `Downsample`, and no
+`input_block_patch` hook. RAUNet as an algorithm has nothing to attach to there; it would
+need a different method rather than a new preset, and pretending otherwise would be worse
+than declining.
+
+The code is laid out so that a family that *does* have a down/up pyramid is additive work:
+
+1. teach `lib_jankhidiffusion/unet_map.py::inspect_unet` to enumerate that architecture's
+   scaling blocks;
+2. add a `Preset` row to `PRESETS` with its native resolution and block pairing;
+3. add its name to `ModelFamily`.
+
+`raunet.py` never names a family — it consumes a `UNetMap` and a settings dict — so it
+should not need changes.
+
+## Tests
+
+An offline harness covers the maths, the block discovery, the patches end-to-end through a
+miniature SDXL-shaped UNet, and the script's argument plumbing under stubbed `modules` /
+`gradio`. No GPU, no checkpoint, no running webui:
+
+```bash
+venv/Scripts/python.exe tests/harness.py
+```
+
+## Layout
+
+```
+lib_jankhidiffusion/
+  utils.py       time windows, block lists, rescaling
+  unet_map.py    runtime block discovery, pairing rules, per-family presets
+  raunet.py      the patches
+  controlnet.py  ControlNet hint-rescaling shim
+  xyz.py         X/Y/Z Plot axes
+scripts/
+  neo_raunet.py  the Forge script
+tests/
+  harness.py
+```
+
+## Credits
+
+* [blepping](https://github.com/blepping) — `comfyui_jankhidiffusion`, the implementation
+  this is ported from.
+* The HiDiffusion authors — the [original method](https://hidiffusion.github.io/).
+* `reforge_jankhidiffusion` — the earlier webui port, whose panel layout this borrows.
