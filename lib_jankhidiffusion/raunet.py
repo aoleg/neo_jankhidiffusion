@@ -380,7 +380,7 @@ def apply_raunet(unet, config: Config, unet_map=None):
     """
 
     if unet_map is not None:
-        problems = unet_map.validate(config.use_blocks)
+        problems = unet_map.validate(config.use_blocks, config.ca_use_blocks, after_skip=config.ca_input_after_skip_mode)
         if problems:
             raise ValueError("; ".join(problems))
 

@@ -441,8 +441,8 @@ for extra in ({"two_stage_upscale_mode": "nearest-exact"}, {"ca_input_after_skip
 #   the CA pairing rule, which is what makes the case above work
 check(umap.ca_paired_output(4) == 5, "CA input 4 pairs with CA output 5 in normal mode")
 check(umap.ca_paired_output(4, after_skip=True) == 4, "after-skip mode shifts the CA pairing in by one")
-check(maps.inspect_unet(make_unet()).advise_ca({("input", 4), ("output", 5)}, after_skip=True), "the wrong CA pairing is flagged before torch.cat can fail on it")
-check(maps.inspect_unet(make_unet()).advise_ca({("input", 4), ("output", 4)}, after_skip=True) == [], "and the right one passes quietly")
+check(umap.validate(set(), {("input", 4), ("output", 5)}, after_skip=True), "the wrong CA pairing is refused before torch.cat can fail on it")
+check(umap.validate(set(), {("input", 4), ("output", 4)}, after_skip=True) == [], "and the right one passes quietly")
 
 #   cross-attention only, which is what the SDXL 'high' preset asks for
 m = make_unet()
@@ -461,6 +461,46 @@ try:
     check(False, "a mismatched input/output pairing is refused")
 except ValueError:
     check(True, "a mismatched input/output pairing is refused")
+
+
+#   Regression: reported from a live SDXL run at 1792px (latent 224). The scaling-block
+#   pairings 3/5 and 6/2 were correct; the crash came from CA output 8 (upstream's SD1.5
+#   default) left in place on an SDXL model, where the pairing is 4/5. It reached
+#   `torch.cat` with "Expected size 24 but got size 56" and "Expected 56 but got 112" -
+#   the code warned about exactly this and then let the run proceed anyway.
+def refusal(main_in, main_out, ca_in, ca_out, **extra):
+    m = make_unet()
+    settings = {**BASE_SETTINGS, "input_blocks": main_in, "output_blocks": main_out, "ca_input_blocks": ca_in, "ca_output_blocks": ca_out, **extra}
+    try:
+        apply_raunet(FakePatcher(m), Config.build(FakePredictor(), **settings), maps.inspect_unet(m))
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+message = refusal("3", "5", "4", "8")
+check(message is not None, "SDXL 3/5 with CA 4/8 is refused instead of crashing at torch.cat")
+check(message and "CA output blocks" in message and "to 5" in message, f"and the refusal names the value to change, got {message!r}")
+check(refusal("6", "2", "4", "8") is not None, "SDXL 6/2 with CA 4/8 is refused too")
+check(refusal("3", "5", "4", "5") is None, "the corrected SDXL pairing 3/5 + CA 4/5 is accepted")
+check(refusal("6", "2", "4", "5") is None, "and 6/2 + CA 4/5")
+check(refusal("3", "5", "", "") is None, "as is the scaling half on its own")
+check(refusal("3", "5", "2", "7") is None, "CA 2/7 is a valid pairing (9 - 2 = 7), just a shallow one")
+check(maps.inspect_unet(make_unet()).advise_ca({("input", 2), ("output", 7)}), "which advise_ca flags as holding no cross-attention")
+check(refusal("3", "5", "", "5") is None, "a CA output with no CA input is harmless, not refused")
+
+#   latent 224 is the reported size, and it exercises the pixel-increment flooring that
+#   turns 56 into 24 rather than 28 - the number in the reported traceback
+latent_1792 = torch.randn(1, 4, 224, 224)
+for label, ca_in, ca_out in (("CA 4/5", "4", "5"), ("CA 2/7", "2", "7"), ("CA off", "", "")):
+    m = make_unet()
+    pt = FakePatcher(m)
+    cfg = Config.build(FakePredictor(), **{**BASE_SETTINGS, "ca_input_blocks": ca_in, "ca_output_blocks": ca_out})
+    apply_raunet(pt, cfg, maps.inspect_unet(m))
+    with torch.no_grad():
+        r = run_unet(m, pt, latent_1792, sigma=13.0)
+    check(r.shape == latent_1792.shape, f"SDXL 3/5 + {label} round-trips at the reported 1792px, got {tuple(r.shape)}")
+    check(cfg.hits_main >= 2, f"and the scaling blocks fired with {label}")
 
 # =======================================================================================
 section("tier 4 - scripts/neo_raunet.py under stubs")
@@ -553,6 +593,7 @@ DEFAULT_UI = {
     "end_time": 0.45,
     "upscale_mode": "bicubic",
     "two_stage_upscale_mode": "disabled",
+    "ca_enabled": True,
     "ca_input_blocks": "4",
     "ca_output_blocks": "5",
     "ca_start_time": 0.0,
@@ -589,6 +630,14 @@ sdxl_high = NeoRAUNet._settings(dict(DEFAULT_UI, model_type="SDXL", res_mode=map
 check(sdxl_high["input_blocks"] == "" and sdxl_high["ca_input_blocks"] == "4", "SDXL 'high' is cross-attention only")
 sdxl_ultra = NeoRAUNet._settings(dict(DEFAULT_UI, model_type="SDXL", res_mode=maps.RES_MODES[2]), maps.ModelFamily.SDXL)
 check(sdxl_ultra["input_blocks"] == "3" and sdxl_ultra["output_blocks"] == "5", "SDXL 'ultra' turns the scaling blocks back on")
+
+off = NeoRAUNet._settings(dict(DEFAULT_UI, mode="Advanced", ca_enabled=False), None)
+check(off["ca_input_blocks"] == "" and off["ca_output_blocks"] == "", "the CA toggle blanks the block lists rather than relying on an empty window")
+on = NeoRAUNet._settings(dict(DEFAULT_UI, mode="Advanced", ca_enabled=True), None)
+check(on["ca_input_blocks"] == "4" and on["ca_output_blocks"] == "5", "and passes them through when enabled")
+check(NeoRAUNet._blocks_for("SDXL")[3]["value"] == "5", "the model-type handler fills the SDXL CA output block")
+check(NeoRAUNet._blocks_for("SD15")[3]["value"] == "11", "and SD1.5's")
+check(NeoRAUNet._blocks_for("auto")[1]["value"] == "5", "auto fills SDXL block numbers")
 
 advanced = NeoRAUNet._settings(dict(DEFAULT_UI, mode="Advanced", ca_fadeout_start_time=0.0), None)
 check(advanced["ca_fadeout_start_time"] is None, "a fadeout slider at 0 disables the fade rather than fading from step 0")

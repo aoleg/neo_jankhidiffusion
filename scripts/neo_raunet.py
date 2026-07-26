@@ -32,7 +32,11 @@ from lib_jankhidiffusion import unet_map as maps
 from lib_jankhidiffusion import xyz
 from lib_jankhidiffusion.controlnet import install as install_controlnet_shim
 from lib_jankhidiffusion.raunet import Config, apply_raunet
-from lib_jankhidiffusion.utils import DOWNSCALE_METHODS, TWO_STAGE_METHODS, UPSCALE_METHODS
+from lib_jankhidiffusion.utils import (
+    DOWNSCALE_METHODS,
+    TWO_STAGE_METHODS,
+    UPSCALE_METHODS,
+)
 
 SIMPLE = "Simple"
 ADVANCED = "Advanced"
@@ -85,11 +89,15 @@ class NeoRAUNet(scripts.Script):
         with InputAccordion(False, label=self.title()) as enable:
             gr.Markdown("Generate above a model's native resolution with fewer duplicated subjects and less mush. SD1.x / SD2.x / SDXL only — this rewrites UNet scaling blocks, which DiT models (Flux, Qwen, Krea 2) do not have.")
 
-            mode = gr.Radio(value=SIMPLE, choices=MODES, label="Mode", info="Simple picks a preset for the model and resolution; Advanced exposes every knob")
+            #   Model type sits outside the Simple group on purpose: it decides the valid
+            #   block numbers, so hiding it in Advanced mode is how you end up hand-editing
+            #   the scaling blocks for SDXL while the CA blocks stay on their SD1.5 values.
+            with gr.Row():
+                mode = gr.Radio(value=SIMPLE, choices=MODES, label="Mode", info="Simple picks a preset for the model and resolution; Advanced exposes every knob")
+                model_type = gr.Dropdown(value="auto", choices=["auto", *FAMILIES], label="Model type", info="auto reads it from the loaded checkpoint; choose SD15 for SD 1.4 / 2.x. Picking one here also fills in the Advanced block numbers")
 
             with gr.Group() as g_simple:
                 with gr.Row():
-                    model_type = gr.Dropdown(value="auto", choices=["auto", *FAMILIES], label="Model type", info="auto reads it from the loaded checkpoint; choose SD15 for SD 1.4 / 2.x")
                     res_mode = gr.Dropdown(value=maps.RES_MODES[1], choices=list(maps.RES_MODES), label="Resolution mode", info="a preset band, not a match against your actual size")
                 with gr.Row():
                     simple_upscale_mode = gr.Dropdown(value="default", choices=["default", *UPSCALE_METHODS], label="Upscale mode")
@@ -98,8 +106,12 @@ class NeoRAUNet(scripts.Script):
             with gr.Group(visible=False) as g_advanced:
                 with gr.Row():
                     input_blocks = gr.Textbox(value="3", label="Input blocks", info="comma-separated Downsample blocks")
-                    output_blocks = gr.Textbox(value="8", label="Output blocks", info="the matching Upsample blocks")
-                gr.Markdown("Pairings — SD1.5: input 3 with output 8, 6 with 5, 9 with 2. SDXL: input 3 with output 5, 6 with 2. HiDiffusion's own SDXL setting is 6/2; 3/5 is gentler.")
+                    output_blocks = gr.Textbox(value="5", label="Output blocks", info="the matching Upsample blocks")
+                gr.Markdown(
+                    "**Scaling block pairings** — SDXL: 3 with 5, 6 with 2. SD1.5: 3 with 8, 6 with 5, 9 with 2. "
+                    "HiDiffusion's own SDXL setting is 6/2; 3/5 is gentler. "
+                    "Defaults on this tab are SDXL — set **Model type** above to SD15 to refill them."
+                )
 
                 time_mode = gr.Dropdown(value="percent", choices=TIME_MODES, label="Time mode", info="how the start/end values below are read; use percent unless you know otherwise")
                 with gr.Row():
@@ -109,10 +121,17 @@ class NeoRAUNet(scripts.Script):
                     upscale_mode = gr.Dropdown(value="bicubic", choices=list(UPSCALE_METHODS), label="Upscale mode", info="bicubic or bislerp")
                     two_stage_upscale_mode = gr.Dropdown(value="disabled", choices=list(TWO_STAGE_METHODS), label="Two-stage upscale", info="do half the upscale with this mode first; different, not necessarily better")
 
-                with gr.Accordion(open=True, label="Cross-attention"):
+                with gr.Accordion(open=False, label="Cross-attention (off by default)"):
+                    #   Off by default and behind a closed accordion because it is the
+                    #   destructive half: it rescales a hidden state the model is about to
+                    #   attend over, and the shallower the block the more violent that is.
+                    #   Measured on SDXL at 1792px: scaling blocks 3/5 alone behave, adding
+                    #   the CA rescale at blocks 2/7 turns the image blotchy.
+                    ca_enabled = gr.Checkbox(value=False, label="Enable the cross-attention rescale", info="a second, independent effect; try the scaling blocks on their own first")
+                    gr.Markdown("**CA pairings** — SDXL: 4 with 5, 5 with 4. SD1.5: 1 with 11, 2 with 10. The rule is `output = block count - input`, and blocks nearer the middle of the UNet (SDXL 4/5) change the image far less than shallow ones.")
                     with gr.Row():
                         ca_input_blocks = gr.Textbox(value="4", label="CA input blocks")
-                        ca_output_blocks = gr.Textbox(value="8", label="CA output blocks")
+                        ca_output_blocks = gr.Textbox(value="5", label="CA output blocks")
                     with gr.Row():
                         ca_start_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="CA start")
                         ca_end_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.3, label="CA end")
@@ -139,11 +158,16 @@ class NeoRAUNet(scripts.Script):
             show_progress=False,
         )
 
-        #   Advanced defaults follow whichever family the Simple tab is pointed at, so the
-        #   two tabs never disagree the way the reForge script's did.
-        advanced_targets = [input_blocks, output_blocks, ca_input_blocks, ca_output_blocks, start_time, end_time, ca_start_time, ca_end_time]
-        model_type.change(fn=self._advanced_defaults, inputs=[model_type, res_mode], outputs=advanced_targets, show_progress=False)
-        res_mode.change(fn=self._advanced_defaults, inputs=[model_type, res_mode], outputs=advanced_targets, show_progress=False)
+        #   Choosing a model type refills the Advanced *block numbers*, which are structural
+        #   facts about that architecture. It deliberately leaves the time windows alone:
+        #   those are the preset's opinion, and overwriting a hand-tuned schedule because
+        #   someone touched a dropdown is worse than the inconsistency it would prevent.
+        model_type.change(
+            fn=self._blocks_for,
+            inputs=[model_type],
+            outputs=[input_blocks, output_blocks, ca_input_blocks, ca_output_blocks],
+            show_progress=False,
+        )
 
         time_sliders = [start_time, end_time, ca_start_time, ca_end_time, ca_fadeout_start_time]
         time_mode.change(fn=self._time_ranges, inputs=[time_mode], outputs=time_sliders, show_progress=False)
@@ -162,6 +186,7 @@ class NeoRAUNet(scripts.Script):
             (end_time, "RAUNet end"),
             (upscale_mode, "RAUNet upscale"),
             (two_stage_upscale_mode, "RAUNet two-stage upscale"),
+            (ca_enabled, "RAUNet CA"),
             (ca_input_blocks, "RAUNet CA input blocks"),
             (ca_output_blocks, "RAUNet CA output blocks"),
             (ca_start_time, "RAUNet CA start"),
@@ -190,6 +215,7 @@ class NeoRAUNet(scripts.Script):
             end_time,
             upscale_mode,
             two_stage_upscale_mode,
+            ca_enabled,
             ca_input_blocks,
             ca_output_blocks,
             ca_start_time,
@@ -217,22 +243,16 @@ class NeoRAUNet(scripts.Script):
         return [gr.update(maximum=maximum, step=step) for _ in range(5)]
 
     @staticmethod
-    def _advanced_defaults(model_type, res_mode):
-        """Fill the Advanced fields from the preset the Simple tab is showing."""
+    def _blocks_for(model_type):
+        """The four Advanced block fields for a model family. SDXL when unspecified."""
 
         family = maps.ModelFamily.SDXL if model_type == "auto" else maps.ModelFamily(model_type)
         preset = maps.PRESETS[family]
-        window = preset.res_modes.get(maps.res_mode_key(res_mode)) or (1.0, 1.0, 1.0, 1.0)
-        start, end, ca_start, ca_end = window
         return [
             gr.update(value=preset.input_blocks),
             gr.update(value=preset.output_blocks),
             gr.update(value=preset.ca_input_blocks),
             gr.update(value=preset.ca_output_blocks),
-            gr.update(value=start),
-            gr.update(value=end),
-            gr.update(value=ca_start),
-            gr.update(value=ca_end),
         ]
 
     # ------------------------------------------------------------- arg plumbing ----
@@ -252,6 +272,7 @@ class NeoRAUNet(scripts.Script):
             "end_time",
             "upscale_mode",
             "two_stage_upscale_mode",
+            "ca_enabled",
             "ca_input_blocks",
             "ca_output_blocks",
             "ca_start_time",
@@ -312,12 +333,12 @@ class NeoRAUNet(scripts.Script):
             #   log line and the infotext both read the way the preset means
             start, end, ca_start, ca_end = window
             main_enabled = start < end
-            ca_enabled = ca_start < ca_end
+            ca_on = ca_start < ca_end
             return {
                 "input_blocks": preset.input_blocks if main_enabled else "",
                 "output_blocks": preset.output_blocks if main_enabled else "",
-                "ca_input_blocks": preset.ca_input_blocks if ca_enabled else "",
-                "ca_output_blocks": preset.ca_output_blocks if ca_enabled else "",
+                "ca_input_blocks": preset.ca_input_blocks if ca_on else "",
+                "ca_output_blocks": preset.ca_output_blocks if ca_on else "",
                 "time_mode": "percent",
                 "start_time": start,
                 "end_time": end,
@@ -331,8 +352,8 @@ class NeoRAUNet(scripts.Script):
         return {
             "input_blocks": ui["input_blocks"],
             "output_blocks": ui["output_blocks"],
-            "ca_input_blocks": ui["ca_input_blocks"],
-            "ca_output_blocks": ui["ca_output_blocks"],
+            "ca_input_blocks": ui["ca_input_blocks"] if ui["ca_enabled"] else "",
+            "ca_output_blocks": ui["ca_output_blocks"] if ui["ca_enabled"] else "",
             "time_mode": ui["time_mode"],
             "start_time": float(ui["start_time"]),
             "end_time": float(ui["end_time"]),

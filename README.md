@@ -53,21 +53,39 @@ generate. `Model type: auto` reads the family from the loaded checkpoint.
 Resolution mode is a preset band, not a check against your actual size — picking `ultra`
 at 1536² is a legitimate thing to do if you want a stronger effect.
 
-### Note on the SDXL presets
+### The two halves, and which one to reach for on SDXL
 
-These are upstream's numbers, and for SDXL they differ sharply from the older reForge
-port's:
+The scaling-block rewrite and the cross-attention rescale are independent, and they are
+not equally safe. **On SDXL, start with the scaling blocks alone.**
+
+Measured on SDXL at 1792px, 40 steps, Euler SMEA Dy CFG++:
+
+| Setting | Result |
+|---|---|
+| scaling blocks 3/5, 0–45%, CA off | works as intended |
+| the same plus CA at blocks 2/7, 0–30% | blotchy |
+
+The cross-attention half rescales a hidden state the model is about to attend over, and
+how violent that is depends entirely on *where*: block 2 rescales the latent at full
+resolution, while block 4 rescales it after two downsamples. Upstream's SDXL choice is
+4/5, the deep one; the reForge fork's SDXL default is 2/7, the shallow one. If you have
+tried RAUNet on SDXL before and remember it wrecking images, shallow CA blocks are a
+strong candidate for why.
+
+That is why the Advanced tab ships with **cross-attention off** behind a closed accordion.
+Turn it on deliberately, with the deep blocks, once the scaling half is behaving.
+
+Upstream and the reForge fork also disagree about which half the *Simple* presets should
+use for SDXL, in opposite directions:
 
 | | scaling blocks | cross-attention |
 |---|---|---|
 | reForge, SDXL high | 0–50% | off |
-| ComfyUI (and here), SDXL high | **off** | **0–50%** |
+| ComfyUI (and the Simple presets here), SDXL high | off | 0–50% (blocks 4/5) |
 
-The two are close to inverted. Upstream's conclusion is that the Downsample/Upsample
-rewrite is the part that hurts SDXL in the 1536–2048 band, and only the cross-attention
-rescale should be on there; the fork enables exactly the half upstream turned off. If your
-memory of RAUNet on SDXL is "it falls apart quickly", that is a likely reason, and the
-Simple presets here will behave noticeably differently.
+The presets here follow upstream, because upstream is the maintained one. The measurement
+above points the other way, so if `Simple / SDXL / high` does nothing you like, use
+Advanced with blocks 3/5, End 0.45, and CA off — that is the configuration verified above.
 
 ## Samplers
 
@@ -144,10 +162,23 @@ a reason not to.
 **Two-stage upscale** — do half the upscale with a second method first. Different, not
 necessarily better; upstream defaults it off and so does this.
 
-**CA input / output blocks** — the cross-attention pair. The pairing rule is
-`output = n_output_blocks - input` (SDXL 4↔5, SD1.5 1↔11), and it shifts by one in
-after-skip mode. A wrong pairing raises a `torch.cat` size error deep in the UNet, so the
-extension checks it and names the block it expected.
+**Enable the cross-attention rescale** — off by default; see
+[the two halves](#the-two-halves-and-which-one-to-reach-for-on-sdxl) for why.
+
+**CA input / output blocks** — the cross-attention pair, and a different rule from the
+scaling blocks: `output = block count - input`.
+
+| Model | valid CA pairs |
+|---|---|
+| SD1.5 / SD2.x (12 blocks) | 1↔11, 2↔10, 4↔8, 5↔7 |
+| SDXL (9 blocks) | 4↔5, 5↔4, 7↔2, 8↔1 |
+
+Deeper is gentler: SDXL 4/5 acts after two downsamples, SDXL 2/7 acts on the latent at
+full resolution. The pairing shifts in by one in after-skip mode. Getting it wrong does
+not degrade the image — it raises a `torch.cat` size error several frames inside the
+UNet's forward pass — so the extension refuses the run before sampling starts and names
+the value to change. Note that upstream's *default* CA pair, 4/8, is an **SD1.5** pairing;
+on SDXL the partner of 4 is 5.
 
 **CA downscale factor / mode** — 2.0 means half size. `avg_pool2d` is stock HiDiffusion
 and only accepts whole numbers; `adaptive_avg_pool2d` matches it for whole numbers and also

@@ -78,8 +78,14 @@ class UNetMap:
         candidate = self.n_output_blocks - 1 - input_block
         return candidate if candidate in self.upsample_blocks else None
 
-    def validate(self, use_blocks) -> list[str]:
-        """Fatal complaints about the scaling blocks: these would crash or do nothing."""
+    def validate(self, use_blocks, ca_use_blocks=(), *, after_skip: bool = False) -> list[str]:
+        """Fatal complaints: configurations that would crash or silently do nothing.
+
+        Everything here is a refusal, not a warning. A broken pairing does not degrade the
+        image, it raises a `torch.cat` size error several frames inside someone else's
+        forward pass — so it has to stop the run before sampling starts, with a message
+        that names the value to change. Advisory-only notes live in `advise_ca`.
+        """
 
         problems = []
         for block_type, index in sorted(use_blocks):
@@ -100,6 +106,21 @@ class UNetMap:
             partner = self.n_output_blocks - 1 - index
             if partner not in inputs:
                 problems.append(f"output block {index} has no matching input block ({partner}) selected")
+
+        ca_inputs = {index for kind, index in ca_use_blocks if kind == "input"}
+        ca_outputs = {index for kind, index in ca_use_blocks if kind == "output"}
+        for index in sorted(ca_inputs):
+            expected = self.ca_paired_output(index, after_skip=after_skip)
+            if not (0 <= expected < self.n_output_blocks) or expected in ca_outputs:
+                continue
+            got = ", ".join(str(o) for o in sorted(ca_outputs)) or "none"
+            mode = " (after-skip mode shifts this pairing in by one)" if after_skip else ""
+            problems.append(
+                f'CA input block {index} requires CA output block {expected} on this model{mode} - set "CA output blocks" to {expected} (currently: {got}). '
+                f"Without it the downscaled hidden state never returns to the size of its skip connection and the UNet fails at torch.cat"
+            )
+        #   The reverse - a CA output with no CA input - is harmless: the output patch
+        #   returns early when h and hsp already match.
         return problems
 
     def ca_paired_output(self, ca_input_block: int, *, after_skip: bool = False) -> int:
@@ -117,8 +138,15 @@ class UNetMap:
 
         return self.n_output_blocks - ca_input_block - (1 if after_skip else 0)
 
-    def advise_ca(self, ca_use_blocks, *, after_skip: bool = False) -> list[str]:
-        """Notes about the cross-attention blocks; the pairing ones predict a crash."""
+    def advise_ca(self, ca_use_blocks, *, after_skip: bool = False) -> list[str]:  # noqa: ARG002
+        """Advisory notes about the cross-attention blocks. Nothing here is fatal.
+
+        A block with no cross-attention still *works* - the patch rescales the hidden
+        state on its way through - it is just not what the effect was designed around, and
+        the shallow blocks in particular are far more destructive than the deep ones
+        (block 2 rescales the latent at full resolution; block 4 rescales it after two
+        downsamples). Worth flagging, not worth refusing.
+        """
 
         notes = []
         for block_type, index in sorted(ca_use_blocks):
@@ -128,14 +156,7 @@ class UNetMap:
                 notes.append(f"CA {block_type} block {index} does not exist on this model (0-{limit - 1})")
             elif index not in valid:
                 pretty = ", ".join(str(v) for v in valid) or "none"
-                notes.append(f"CA {block_type} block {index} holds no cross-attention on this model (blocks that do: {pretty})")
-
-        outputs = {index for kind, index in ca_use_blocks if kind == "output"}
-        for index in sorted(index for kind, index in ca_use_blocks if kind == "input"):
-            expected = self.ca_paired_output(index, after_skip=after_skip)
-            if 0 <= expected < self.n_output_blocks and expected not in outputs:
-                mode = " (after-skip mode shifts this by one)" if after_skip else ""
-                notes.append(f"CA input block {index} needs CA output block {expected} to undo its downscale{mode}; without it the skip connection will not match and the UNet will fail")
+                notes.append(f"CA {block_type} block {index} holds no cross-attention on this model (blocks that do: {pretty}); it will still rescale, but shallow blocks change the image far more than deep ones")
         return notes
 
 
