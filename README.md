@@ -11,6 +11,19 @@ changing where the UNet's resolution pyramid sits, for the first part of samplin
 **Supports SD 1.x, SD 2.x and SDXL.** It does not support DiT models (Flux, Qwen, Chroma,
 Krea 2) — see [Other model families](#other-model-families).
 
+Human here. **Current status:** finally usable. Best results with https://github.com/aoleg/Neo_ExtraSchedulers
+Euler Dy CFG++/Euler SMEA Dy CFG++ samplers, but other samplers work fine in both
+Simple and Advanced modes. For non-Dy samplers, the Advanced mode has the "churn" setting.
+Adjust it accordingly: bump to increase detail, reduce if the image starts looking blotched or
+faces/limbs collapse. In a sense, this now perfectly matches the reForge implementation.
+
+The reForge implementation was working there because of two bugs in two different places;
+Claude will tell you exactly what they were. When implemented properly, RAUNet is all but
+unusable. However, the two bugs helped me find the right direction and make this extension
+usable with literally any sampler/scheduler combo. Clean hi-resolution images in one go.
+
+Now back to Claude.
+
 ## Install
 
 Clone into `extensions/`:
