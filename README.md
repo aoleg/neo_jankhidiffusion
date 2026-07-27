@@ -112,6 +112,37 @@ behind a closed accordion — turn it on deliberately, with the deep blocks.
 > Euler SMEA Dy, whose re-noising was masking exactly the blotching described above.
 > Upstream's preset was right.
 
+#### Why reForge's Advanced tab looked better
+
+The reForge port defaults to scaling blocks 0–0.45 with cross-attention off, and that
+combination is reported to work well there — while the same settings blotch here on every
+sampler except Euler Dy and Euler SMEA Dy. The scaling-block code is not the difference:
+the downsample rewrite in this port is bit-identical to reForge's and ComfyUI's (same
+weights, stride 4 / dilation 2 / padding 2, verified with `torch.equal`), and the upsample
+path is the same interpolate-then-conv.
+
+The difference is in the **samplers**. reForge's `sample_euler_dy_cfg_pp`
+(`ldm_patched/k_diffusion/sampling.py`) computes
+
+```python
+gamma = max(s_churn / (len(sigmas) - 1), 2**0.5 - 1)
+if s_dy_pow >= 0:                       # default -1.0, so this never runs
+    gamma = gamma * (1.0 - (i / (len(sigmas) - 2)) ** s_dy_pow)
+```
+
+With its shipped defaults (`s_churn = 0`, `s_dy_pow = -1`) that pins gamma at **0.414 on
+every step** — the sampler re-noises the latent to `sigma * 1.414` each step and denoises
+it again. That is the "severely noisy image resolved in the last steps" you see in the
+live preview, and it is what anneals the scaling-block artifacts away.
+
+reForge's Advanced tab therefore never looked good *because RAUNet behaved better there*.
+It looked good because its Dy samplers churn hard by default, and reForge blotches on
+non-Dy samplers for the same reason ours does.
+
+**So the scaling-block half needs a churning sampler, in either webui.** If you want it,
+use a sampler with churn — and note that `Neo_ExtraSchedulers`' CFG++ Dy ports use `min`
+where reForge uses `max`, so they run at gamma 0 and provide none.
+
 ## Samplers
 
 **Use a CFG++ sampler.** That is the short version, and it is measured rather than
