@@ -20,7 +20,9 @@ faces/limbs collapse. In a sense, this now perfectly matches the reForge impleme
 The reForge implementation was working there because of two bugs in two different places;
 Claude will tell you exactly what they were. When implemented properly, RAUNet is all but
 unusable. However, the two bugs helped me find the right direction and make this extension
-usable with literally any sampler/scheduler combo. Clean hi-resolution images in one go.
+usable with literally any Euler-based sampler/scheduler combo. 
+
+Clean hi-resolution images in one go.
 
 Now back to Claude.
 
