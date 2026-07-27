@@ -39,18 +39,25 @@ Both stop at their end percentage, after which the model runs completely unmodif
 ## Quick start
 
 Leave **Mode** on *Simple*, set **Resolution mode** to the band you are generating in, and
-generate. `Model type: auto` reads the family from the loaded checkpoint.
+generate.
 
-**Model type** only chooses the *timing*. The block numbers always come from the model
-that is loaded — they are read off its structure at runtime, not looked up in a table — so
-a wrong Model type costs you a suboptimal schedule, never a broken configuration. The
-setting persists in `ui-config.json`, so if you pick a family once it stays picked; when it
-disagrees with the checkpoint the log says so, and every run reports which source the
-family came from:
+**Model family** defaults to SDXL (set it to `auto` to read it from the loaded
+checkpoint) and only chooses the *timing*. The block numbers always
+come from the model that is loaded — read off its structure at runtime, not looked up in a
+table — so a wrong family costs you a suboptimal schedule, never a broken configuration.
+`auto` is still available and still detects correctly. When the choice disagrees with the
+checkpoint the log says so, and every run reports which source the family came from:
 
 ```
 RAUNet [first pass]: SDXL (from checkpoint), blocks [input3, output5] …
 ```
+
+> **Upgrading from an earlier version?** Forge pins every UI default into
+> `ui-config.json` the first time a script loads, and the saved value then wins over the
+> code. Fields whose defaults changed have been renamed (`Input blocks` →
+> `Scaling input blocks`, and so on) so the new defaults take effect. If any field still
+> shows a stale value, delete its `customscript/neo_raunet.py/...` lines from
+> `ui-config.json` and restart.
 
 | Model | Resolution mode | What the preset does |
 |---|---|---|
@@ -66,37 +73,44 @@ at 1536² is a legitimate thing to do if you want a stronger effect.
 
 ### The two halves, and which one to reach for on SDXL
 
-The scaling-block rewrite and the cross-attention rescale are independent, and they are
-not equally safe. **On SDXL, start with the scaling blocks alone.**
+The scaling-block rewrite and the cross-attention rescale are independent, and on SDXL
+**which one you want depends on the resolution band.** Upstream's presets encode this and
+they turn out to be right:
 
-Measured on SDXL at 1792px, 40 steps, Euler SMEA Dy CFG++:
+| Band | scaling blocks | cross-attention |
+|---|---|---|
+| ≤ 1024 | off | off — nothing to correct |
+| 1536–2048 (`high`) | **off** | 0–50%, blocks 4/5 |
+| over 2048 (`ultra`) | 0–45%, blocks 3/5 | 0–60% |
+
+Measured on SDXL at 1792px, 40 steps, Beta, same seed:
 
 | Setting | Result |
 |---|---|
-| scaling blocks 3/5, 0–45%, CA off | works as intended |
-| the same plus CA at blocks 2/7, 0–30% | blotchy |
+| cross-attention only, blocks 4/5, 0–50% (`Simple / high`) | clean on Euler CFG++ |
+| scaling blocks 3/5, 0–45%, CA off | blotched — "noise" objects over the picture |
+| scaling blocks 3/5 plus CA | the same blotches, plus deformities |
 
-The cross-attention half rescales a hidden state the model is about to attend over, and
-how violent that is depends entirely on *where*: block 2 rescales the latent at full
-resolution, while block 4 rescales it after two downsamples. Upstream's SDXL choice is
-4/5, the deep one; the reForge fork's SDXL default is 2/7, the shallow one. If you have
-tried RAUNet on SDXL before and remember it wrecking images, shallow CA blocks are a
-strong candidate for why.
+The scaling-block rewrite is by far the bigger intervention — it changes the resolution
+the whole lower half of the UNet operates at — and at 1792px that is more correction than
+the image needs. **If an Advanced config blotches, clearing the scaling blocks is the
+first thing to try.** The extension now warns when they are enabled at or below 2048px.
 
-That is why the Advanced tab ships with **cross-attention off** behind a closed accordion.
-Turn it on deliberately, with the deep blocks, once the scaling half is behaving.
+The `sd-forge-extra-samplers` Euler Dy and Euler SMEA Dy hide this, which is worth knowing
+because it can send you chasing the wrong variable: both re-noise the latent every step
+(see [Samplers](#samplers)), so blotches get smoothed away along with fine detail. A
+config that only looks clean under those two is not clean.
 
-Upstream and the reForge fork also disagree about which half the *Simple* presets should
-use for SDXL, in opposite directions:
+Within the cross-attention half, *where* matters as much as whether: block 2 rescales the
+latent at full resolution, block 4 rescales it after two downsamples. Upstream's SDXL
+choice is 4/5, the deep one; the reForge fork's SDXL default is 2/7, the shallow one, and
+that is blotchy in its own right. The Advanced tab ships with cross-attention **off**
+behind a closed accordion — turn it on deliberately, with the deep blocks.
 
-| | scaling blocks | cross-attention |
-|---|---|---|
-| reForge, SDXL high | 0–50% | off |
-| ComfyUI (and the Simple presets here), SDXL high | off | 0–50% (blocks 4/5) |
-
-The presets here follow upstream, because upstream is the maintained one. The measurement
-above points the other way, so if `Simple / SDXL / high` does nothing you like, use
-Advanced with blocks 3/5, End 0.45, and CA off — that is the configuration verified above.
+> **An earlier version of this file said the opposite** — that upstream was wrong to
+> disable the scaling blocks for SDXL `high`. That was based on a single generation with
+> Euler SMEA Dy, whose re-noising was masking exactly the blotching described above.
+> Upstream's preset was right.
 
 ## Samplers
 
@@ -244,7 +258,7 @@ when shapes already match, and is left installed afterwards. Set
 
 ## X/Y/Z Plot
 
-Twenty axes are registered under `[RAUNet] …` — Enable, Mode, Model type, Resolution mode,
+Twenty axes are registered under `[RAUNet] …` — Enable, Mode, Model family, Resolution mode,
 the block lists, all the time windows, the fadeout, the downscale factor and mode, both
 upscale modes, and Min megapixels.
 

@@ -38,7 +38,7 @@ def register(cache: dict, upscale_methods, downscale_methods, res_modes, familie
         [
             xyz_grid.AxisOption("[RAUNet] Enable", str, apply_field("enable"), choices=xyz_grid.boolean_choice(reverse=True)),
             xyz_grid.AxisOption("[RAUNet] Mode", str, apply_field("mode"), choices=lambda: ["Simple", "Advanced"]),
-            xyz_grid.AxisOption("[RAUNet] Model type", str, apply_field("model_type"), choices=lambda: ["auto", *families]),
+            xyz_grid.AxisOption("[RAUNet] Model family", str, apply_field("model_type"), choices=lambda: [*families, "auto"]),
             xyz_grid.AxisOption("[RAUNet] Resolution mode", str, apply_field("res_mode"), choices=lambda: list(res_modes)),
             xyz_grid.AxisOption("[RAUNet] Input blocks", str, apply_field("input_blocks")),
             xyz_grid.AxisOption("[RAUNet] Output blocks", str, apply_field("output_blocks")),

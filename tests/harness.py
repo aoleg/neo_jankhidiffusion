@@ -680,6 +680,8 @@ check(on["ca_input_blocks"] == "4" and on["ca_output_blocks"] == "5", "and passe
 check(NeoRAUNet._blocks_for("SDXL")[3]["value"] == "5", "the model-type handler fills the SDXL CA output block")
 check(NeoRAUNet._blocks_for("SD15")[3]["value"] == "11", "and SD1.5's")
 check(NeoRAUNet._blocks_for("auto")[1]["value"] == "5", "auto fills SDXL block numbers")
+check(neo_raunet.DEFAULT_MODEL_TYPE == "SDXL", "SDXL is the default model family")
+check(neo_raunet.MODEL_TYPE_CHOICES[0] == "SDXL", "and it is listed first")
 
 advanced = NeoRAUNet._settings(dict(DEFAULT_UI, mode="Advanced", ca_fadeout_start_time=0.0), None)
 check(advanced["ca_fadeout_start_time"] is None, "a fadeout slider at 0 disables the fade rather than fading from step 0")
@@ -721,6 +723,9 @@ check(not neo_raunet._is_forgiving_sampler(""), "a missing sampler name is handl
 #   the full hook sequence, so an XYZ override has to survive from `process` to
 #   `process_before_every_sampling` and the patches have to land on the cloned unet
 class FakeP:
+    width = 1024
+    height = 1024
+
     def __init__(self, model, sampler_name="Euler a", is_hr_pass=False):
         patcher = FakePatcher(model)
         patcher.clone = lambda: patcher
@@ -756,6 +761,38 @@ NeoRAUNet.configs = []
 script.process_before_every_sampling(FakeP(make_unet(), sampler_name="Euler Dy CFG++"), True, *ordered_args)
 check(not any("neither a CFG++" in msg for level, msg in log_records), "the sampler note stays quiet for a Dy sampler")
 
+#   Reported: Advanced with the scaling blocks on, at 1792px, blotched under Euler,
+#   Euler CFG++ and Euler Dy CFG++ alike. Upstream only enables that half above 2048 - the
+#   1536-2048 band is cross-attention only - so the band mismatch has to be called out.
+log_records.clear()
+NeoRAUNet.configs = []
+adv = dict(DEFAULT_UI, mode="Advanced", model_type="SDXL", ca_enabled=False)
+adv_args = tuple(adv.values())
+band_p = FakeP(make_unet())
+band_p.width, band_p.height = 1792, 1792
+script.process(band_p, True, *adv_args)
+script.process_before_every_sampling(band_p, True, *adv_args)
+check(any("only enables them above 2048" in msg for level, msg in log_records if level == "warning"), "scaling blocks below 2048 are flagged")
+
+log_records.clear()
+NeoRAUNet.configs = []
+wide_p = FakeP(make_unet())
+wide_p.width, wide_p.height = 2560, 1440
+script.process_before_every_sampling(wide_p, True, *adv_args)
+check(not any("only enables them above 2048" in msg for level, msg in log_records), "and above 2048 they are not")
+
+log_records.clear()
+NeoRAUNet.configs = []
+ca_only = dict(DEFAULT_UI, mode="Advanced", model_type="SDXL", ca_enabled=True, input_blocks="", output_blocks="")
+ca_p = FakeP(make_unet())
+ca_p.width, ca_p.height = 1792, 1792
+script.process(ca_p, True, *tuple(ca_only.values()))
+script.process_before_every_sampling(ca_p, True, *tuple(ca_only.values()))
+check(not any("only enables them above 2048" in msg for level, msg in log_records), "a cross-attention-only config is not flagged at 1792px")
+NeoRAUNet.active = False
+NeoRAUNet.resolved = {}
+NeoRAUNet.configs = []
+
 #   Simple mode on an SDXL checkpoint with the dropdown stuck on SD15: it must say so, and
 #   it must still patch the blocks this model actually has
 log_records.clear()
@@ -766,7 +803,7 @@ script.process(simple_p, True, *simple_args)
 script.process_before_every_sampling(simple_p, True, *simple_args)
 check(any("looks like SDXL" in msg for level, msg in log_records if level == "warning"), "a Model type that disagrees with the checkpoint is called out")
 check(NeoRAUNet.configs and NeoRAUNet.configs[0].use_blocks == {("input", 3), ("output", 5)}, f"and the run still uses this model's blocks, got {NeoRAUNet.configs[0].use_blocks if NeoRAUNet.configs else None}")
-check(any("(from Model type dropdown)" in msg for level, msg in log_records if level == "info"), "the log says where the family came from")
+check(any("(from Model family dropdown)" in msg for level, msg in log_records if level == "info"), "the log says where the family came from")
 NeoRAUNet.active = False
 NeoRAUNet.resolved = {}
 NeoRAUNet.configs = []

@@ -45,7 +45,12 @@ ADVANCED = "Advanced"
 MODES = [SIMPLE, ADVANCED]
 
 TIME_MODES = ["percent", "timestep", "sigma"]
-FAMILIES = [str(family) for family in maps.ModelFamily]
+#   SDXL first and default: it is what this port targets, and SD1.x is marginal now.
+#   `auto` still works and still detects correctly - it is just not the default, so a
+#   fresh install never starts on another architecture's numbers.
+FAMILIES = [str(maps.ModelFamily.SDXL), str(maps.ModelFamily.SD15)]
+MODEL_TYPE_CHOICES = [*FAMILIES, "auto"]
+DEFAULT_MODEL_TYPE = str(maps.ModelFamily.SDXL)
 
 #   Samplers that absorb the end of the RAUNet window without visible damage. Measured on
 #   SDXL at 1792px with the SDXL 'high' preset (cross-attention 0-50%):
@@ -71,6 +76,12 @@ def _is_forgiving_sampler(name: str) -> bool:
 #   Native resolution, times a little headroom, is the gate threshold. 1024x1024 SDXL is
 #   1.05MP, so 1.1x keeps "exactly native" on the skip side without excluding 1152x896.
 AUTO_GATE_HEADROOM = 1.1
+
+#   Upstream's SDXL presets enable the scaling-block rewrite only in the `ultra` band,
+#   "over 2048"; the 1536-2048 band gets cross-attention alone. Measured at 1792px, that
+#   division is real - scaling blocks 3/5 at 0-45% blotch on Euler, Euler CFG++ and Euler
+#   Dy CFG++ alike. The Advanced tab cannot know your band, so it says so instead.
+SCALING_BLOCK_MIN_SIDE = 2048
 
 #   The four time sliders mean different things per time mode, and 0-1 is only right for
 #   one of them: timesteps run 0-999 and sigma tops out around 14.6 on an SD schedule.
@@ -102,12 +113,13 @@ class NeoRAUNet(scripts.Script):
         with InputAccordion(False, label=self.title()) as enable:
             gr.Markdown("Generate above a model's native resolution with fewer duplicated subjects and less mush. SD1.x / SD2.x / SDXL only — this rewrites UNet scaling blocks, which DiT models (Flux, Qwen, Krea 2) do not have.")
 
-            #   Model type sits outside the Simple group on purpose: it decides the valid
-            #   block numbers, so hiding it in Advanced mode is how you end up hand-editing
-            #   the scaling blocks for SDXL while the CA blocks stay on their SD1.5 values.
+            #   Model family sits outside the Simple group on purpose: it refills the
+            #   Advanced block numbers, so hiding it in Advanced mode is how you end up
+            #   hand-editing the scaling blocks while the CA blocks keep another
+            #   architecture's values.
             with gr.Row():
                 mode = gr.Radio(value=SIMPLE, choices=MODES, label="Mode", info="Simple picks a preset for the model and resolution; Advanced exposes every knob")
-                model_type = gr.Dropdown(value="auto", choices=["auto", *FAMILIES], label="Model type", info="auto reads it from the loaded checkpoint; choose SD15 for SD 1.4 / 2.x. Picking one here also fills in the Advanced block numbers")
+                model_type = gr.Dropdown(value=DEFAULT_MODEL_TYPE, choices=list(MODEL_TYPE_CHOICES), label="Model family", info="decides the timing only - block numbers always come from the loaded checkpoint. Choosing one here also refills the Advanced block numbers; 'auto' reads it from the checkpoint")
 
             with gr.Group() as g_simple:
                 with gr.Row():
@@ -118,12 +130,12 @@ class NeoRAUNet(scripts.Script):
 
             with gr.Group(visible=False) as g_advanced:
                 with gr.Row():
-                    input_blocks = gr.Textbox(value="3", label="Input blocks", info="comma-separated Downsample blocks")
-                    output_blocks = gr.Textbox(value="5", label="Output blocks", info="the matching Upsample blocks")
+                    input_blocks = gr.Textbox(value="3", label="Scaling input blocks", info="comma-separated Downsample blocks")
+                    output_blocks = gr.Textbox(value="5", label="Scaling output blocks", info="the matching Upsample blocks")
                 gr.Markdown(
                     "**Scaling block pairings** — SDXL: 3 with 5, 6 with 2. SD1.5: 3 with 8, 6 with 5, 9 with 2. "
                     "HiDiffusion's own SDXL setting is 6/2; 3/5 is gentler. "
-                    "Defaults on this tab are SDXL — set **Model type** above to SD15 to refill them."
+                    "Defaults on this tab are SDXL — set **Model family** above to SD15 to refill them."
                 )
 
                 time_mode = gr.Dropdown(value="percent", choices=TIME_MODES, label="Time mode", info="how the start/end values below are read; use percent unless you know otherwise")
@@ -144,7 +156,7 @@ class NeoRAUNet(scripts.Script):
                     gr.Markdown("**CA pairings** — SDXL: 4 with 5, 5 with 4. SD1.5: 1 with 11, 2 with 10. The rule is `output = block count - input`, and blocks nearer the middle of the UNet (SDXL 4/5) change the image far less than shallow ones.")
                     with gr.Row():
                         ca_input_blocks = gr.Textbox(value="4", label="CA input blocks")
-                        ca_output_blocks = gr.Textbox(value="5", label="CA output blocks")
+                        ca_output_blocks = gr.Textbox(value="5", label="CA output block")
                     with gr.Row():
                         ca_start_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="CA start")
                         ca_end_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.3, label="CA end")
@@ -325,7 +337,7 @@ class NeoRAUNet(scripts.Script):
 
         if ui["mode"] == SIMPLE:
             if family is None:
-                logger.warning("RAUNet: could not identify the model family; pick one explicitly next to the Mode radio")
+                logger.warning("RAUNet: could not identify the model family; pick one explicitly in Model family")
                 return None
 
             preset = maps.PRESETS[family]
@@ -476,12 +488,12 @@ class NeoRAUNet(scripts.Script):
 
         detected, source = family, "checkpoint"
         if ui["model_type"] != "auto":
-            family, source = maps.ModelFamily(ui["model_type"]), "Model type dropdown"
+            family, source = maps.ModelFamily(ui["model_type"]), "Model family dropdown"
             if detected is not None and family is not detected:
                 #   The dropdown persists in ui-config.json, so a value chosen during one
                 #   experiment silently governs every later run. Say so rather than quietly
                 #   applying the other architecture's schedule.
-                logger.warning(f"RAUNet: Model type is set to {family}, but this checkpoint looks like {detected}. Set it back to 'auto' unless you mean it")
+                logger.warning(f"RAUNet: Model family is set to {family}, but this checkpoint looks like {detected}. Set it to 'auto' unless you mean it")
 
         settings = self._settings(ui, family, unet_map)
         if settings is None:
@@ -527,6 +539,20 @@ class NeoRAUNet(scripts.Script):
 
         for note in unet_map.advise_ca(config.ca_use_blocks, after_skip=config.ca_input_after_skip_mode):
             logger.warning(f"RAUNet: {note}")
+
+        #   The band check. This is the single most likely reason an Advanced config
+        #   blotches: the scaling-block rewrite is a much bigger intervention than the
+        #   cross-attention rescale, and upstream only turns it on above 2048.
+        if config.use_blocks:
+            width = (getattr(p, "hr_upscale_to_x", 0) if is_hr else 0) or getattr(p, "width", 0) or 0
+            height = (getattr(p, "hr_upscale_to_y", 0) if is_hr else 0) or getattr(p, "height", 0) or 0
+            longest = max(width, height)
+            if 0 < longest <= SCALING_BLOCK_MIN_SIDE:
+                logger.warning(
+                    f"RAUNet: the scaling blocks are enabled at {width}x{height}, but upstream only enables them above {SCALING_BLOCK_MIN_SIDE}px; "
+                    f"the 1536-{SCALING_BLOCK_MIN_SIDE} band uses cross-attention alone (that is what Simple / high does). "
+                    "Blotching at this size is expected - clear Input/Output blocks and enable the cross-attention rescale instead."
+                )
 
         sampler = (getattr(p, "hr_sampler_name", None) if is_hr else None) or getattr(p, "sampler_name", "") or ""
         if _is_forgiving_sampler(sampler):
