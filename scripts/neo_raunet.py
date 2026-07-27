@@ -16,8 +16,10 @@ Three things here are Forge-specific rather than ported:
   alone.  The gate skips the effect whenever the latent being denoised is at or below the
   model's native resolution, which fixes that and, as a side effect, keeps RAUNet out of
   the half-resolution sub-steps that Euler Dy and friends take.
-* **The sampler note.**  See the README; RAUNet is much better behaved under the Dy /
-  CFG++ family, and if the settings are aggressive on a plain sampler it says so once.
+* **The sampler note.**  Measured: RAUNet is much better behaved under CFG++ samplers,
+  which steer along the unconditional prediction and so do not multiply its resampling
+  artifacts by the guidance scale.  If the settings are aggressive on a sampler that is
+  neither CFG++ nor Dy, the log says so once.  See the README.
 * **XYZ axes and infotext**, as usual for a webui script.
 """
 
@@ -45,14 +47,25 @@ MODES = [SIMPLE, ADVANCED]
 TIME_MODES = ["percent", "timestep", "sigma"]
 FAMILIES = [str(family) for family in maps.ModelFamily]
 
-#   Samplers that take an extra denoising sub-step on a rescaled latent. They interact
-#   unusually well with RAUNet - see README, "Samplers".  Matched as whole words, so a
-#   future sampler with "dy" buried in its name is not mistaken for one.
-DY_MARKERS = frozenset({"dy", "smea"})
+#   Samplers that absorb the end of the RAUNet window without visible damage. Measured on
+#   SDXL at 1792px with the SDXL 'high' preset (cross-attention 0-50%):
+#
+#     Euler                deformed faces and limbs
+#     Euler CFG++          clean
+#     Euler Dy CFG++       clean, and near-identical to Euler CFG++
+#     Euler Dy             clean, but heavily re-noised - see README
+#
+#   So it is the **CFG++ combination** that carries this, not the Dy sub-step: at 40 steps
+#   `dy_sampling_step` fires twice (`if i // 2 == 1`), which is why the two CFG++ variants
+#   land in the same place. Dy stays on the list because it does help on its own.
+#
+#   Matched as whole words, so a sampler with "dy" buried in its name is not mistaken for
+#   one; "+" is kept in the token so "cfg++" survives the split.
+FORGIVING_MARKERS = frozenset({"cfg++", "cfgpp", "dy", "smea"})
 
 
-def _is_dy_sampler(name: str) -> bool:
-    return bool(DY_MARKERS & set(re.split(r"[^a-z0-9+]+", (name or "").lower())))
+def _is_forgiving_sampler(name: str) -> bool:
+    return bool(FORGIVING_MARKERS & set(re.split(r"[^a-z0-9+]+", (name or "").lower())))
 
 
 #   Native resolution, times a little headroom, is the gate threshold. 1024x1024 SDXL is
@@ -516,7 +529,7 @@ class NeoRAUNet(scripts.Script):
             logger.warning(f"RAUNet: {note}")
 
         sampler = (getattr(p, "hr_sampler_name", None) if is_hr else None) or getattr(p, "sampler_name", "") or ""
-        if _is_dy_sampler(sampler):
+        if _is_forgiving_sampler(sampler):
             return
         if str(settings.get("time_mode", "percent")) != "percent":
             return
@@ -532,7 +545,7 @@ class NeoRAUNet(scripts.Script):
         if config.ca_use_blocks and not settings.get("ca_fadeout_start_time"):
             cutoffs.append(float(settings.get("ca_end_time", 0.0)))
         if cutoffs and max(cutoffs) >= 0.4:
-            logger.info(f"RAUNet: '{sampler}' is not one of the Dy / SMEA samplers, whose rescaled sub-steps ride out the end of the RAUNet window much better. If the image degrades, lower End / CA end or set a CA fadeout start.")
+            logger.info(f"RAUNet: '{sampler}' is neither a CFG++ nor a Dy sampler. Those absorb the end of the RAUNet window much better - measured on SDXL, plain Euler deforms faces and limbs where Euler CFG++ does not. If the image degrades, switch to a CFG++ variant, lower End / CA end, or set a CA fadeout start.")
 
     def postprocess(self, p, processed, *args):
         cls = NeoRAUNet

@@ -381,6 +381,33 @@ with torch.no_grad():
     run_unet(model_gate, patcher_gate, latent_2048, sigma=13.0)
 check(config_gate.hits_main >= 2, "the same config still fires above the gate")
 
+#   Determinism across a rescaled sub-step. Euler Dy and friends re-enter the model on a
+#   half-resolution latent mid-step, which runs `note_shape` again and flips the resolution
+#   gate. If any of that state survived into the next full-resolution forward, the same seed
+#   would stop reproducing - so assert the interleaved call changes nothing downstream.
+plain_a = make_unet()
+patcher_a = FakePatcher(plain_a)
+cfg_a = Config.build(FakePredictor(), min_megapixels=1.155, **BASE_SETTINGS)
+apply_raunet(patcher_a, cfg_a, maps.inspect_unet(plain_a))
+
+model_b = make_unet()
+model_b.load_state_dict(plain_a.state_dict())
+patcher_b = FakePatcher(model_b)
+cfg_b = Config.build(FakePredictor(), min_megapixels=1.155, **BASE_SETTINGS)
+apply_raunet(patcher_b, cfg_b, maps.inspect_unet(model_b))
+
+with torch.no_grad():
+    clean_first = run_unet(plain_a, patcher_a, latent_2048, sigma=13.0)
+    clean_second = run_unet(plain_a, patcher_a, latent_2048, sigma=11.0)
+
+    interleaved_first = run_unet(model_b, patcher_b, latent_2048, sigma=13.0)
+    run_unet(model_b, patcher_b, torch.zeros(1, 4, 128, 128), sigma=13.0)  # the Dy sub-step
+    interleaved_second = run_unet(model_b, patcher_b, latent_2048, sigma=11.0)
+
+check(torch.equal(clean_first, interleaved_first), "the forward before a half-resolution sub-step is unaffected")
+check(torch.equal(clean_second, interleaved_second), "and so is the one after it - a rescaled sub-step leaks no state")
+check(cfg_b.skips_resolution == 1 and cfg_a.skips_resolution == 0, "the sub-step was gated out, so it really did take the other branch")
+
 #   odd latent sizes: 1536x1024 is 96x64 latent, and 4x scaling has to survive it
 model_odd = make_unet()
 patcher_odd = FakePatcher(model_odd)
@@ -680,11 +707,15 @@ check(still_enabled is False, "an XYZ 'Enable=False' cell switches the effect of
 check(ui["end_time"] == 0.7, "an XYZ value overrides the UI value")
 check(NeoRAUNet.xyz_cache == {}, "and the cache is cleared afterwards")
 
-check(neo_raunet._is_dy_sampler("Euler Dy CFG++"), "Euler Dy CFG++ is recognised")
-check(neo_raunet._is_dy_sampler("Euler SMEA Dy"), "Euler SMEA Dy is recognised")
-check(not neo_raunet._is_dy_sampler("DPM++ 2M SDE"), "an ordinary sampler is not")
-check(not neo_raunet._is_dy_sampler("Dynamic Thresholding"), "and 'dy' inside a word does not count")
-check(not neo_raunet._is_dy_sampler(""), "a missing sampler name is handled")
+#   Reported measurements: Euler deforms faces and limbs, Euler CFG++ does not, and the
+#   two CFG++ variants land in the same place. The advisory has to stay quiet for every
+#   sampler that was actually fine - it was firing on Euler CFG++ before.
+for good in ("Euler Dy CFG++", "Euler SMEA Dy", "Euler CFG++", "Euler a CFG++", "Euler Dy"):
+    check(neo_raunet._is_forgiving_sampler(good), f"{good} is recognised as forgiving")
+for plain in ("Euler", "Euler a", "DPM++ 2M SDE", "Heun", "DDIM", "Restart"):
+    check(not neo_raunet._is_forgiving_sampler(plain), f"{plain} is not")
+check(not neo_raunet._is_forgiving_sampler("Dynamic Thresholding"), "'dy' inside a word does not count")
+check(not neo_raunet._is_forgiving_sampler(""), "a missing sampler name is handled")
 
 
 #   the full hook sequence, so an XYZ override has to survive from `process` to
@@ -718,12 +749,12 @@ patched = fake_p.sd_model.forge_objects.unet
 check("diffusion_model.input_blocks.3.0.forward" in patched.object_patches, "the sampling hook patched the unet")
 check(NeoRAUNet.configs and NeoRAUNet.configs[0].ca_downscale_factor == 1.5, "and it used the XYZ value, not the UI one")
 check(abs(NeoRAUNet.configs[0].min_megapixels - 1.155) < 1e-3, "the auto gate resolved against the detected SDXL family")
-check(any("not one of the Dy" in msg for level, msg in log_records if level == "info"), "and the sampler note fired for a non-Dy sampler")
+check(any("neither a CFG++ nor a Dy sampler" in msg for level, msg in log_records if level == "info"), "and the sampler note fired for a plain sampler")
 
 log_records.clear()
 NeoRAUNet.configs = []
 script.process_before_every_sampling(FakeP(make_unet(), sampler_name="Euler Dy CFG++"), True, *ordered_args)
-check(not any("not one of the Dy" in msg for level, msg in log_records), "the sampler note stays quiet for a Dy sampler")
+check(not any("neither a CFG++" in msg for level, msg in log_records), "the sampler note stays quiet for a Dy sampler")
 
 #   Simple mode on an SDXL checkpoint with the dropdown stuck on SD15: it must say so, and
 #   it must still patch the blocks this model actually has

@@ -100,17 +100,35 @@ Advanced with blocks 3/5, End 0.45, and CA off — that is the configuration ver
 
 ## Samplers
 
-RAUNet is much better behaved under **Euler Dy**, **Euler Dy CFG++**, **Euler SMEA Dy**
-and relatives (from
-[sd-forge-extra-samplers](https://github.com/MisterChief95/sd-forge-extra-samplers) and
-[Neo_ExtraSchedulers](https://github.com/aoleg/Neo_ExtraSchedulers)) than under
-plain samplers. The mechanism is not mysterious: those samplers take an extra denoising
-sub-step on a *half-resolution* latent early in the schedule, which locks the composition
-in at something near the model's native scale — the same problem RAUNet is solving, from
-the other end. Ordinary samplers get no such help, and the abrupt end of the RAUNet window
-lands on them undamped.
+**Use a CFG++ sampler.** That is the short version, and it is measured rather than
+theorised — SDXL, 1792px, 40 steps, Beta schedule, `Simple / SDXL / high`
+(cross-attention 0–50%), same seed throughout:
 
-Rather than build sampler logic into this extension, the fixes for that live where the
+| Sampler | Result |
+|---|---|
+| Euler | deformed faces and limbs |
+| Euler CFG++ | clean |
+| Euler Dy CFG++ | clean, and near-identical to Euler CFG++ |
+| Euler Dy | clean, but see the caveat below |
+
+CFG++ samplers steer along the *unconditional* prediction instead of the CFG-amplified
+one, so the resampling artifacts RAUNet introduces do not get multiplied by the guidance
+scale. That is what carries the result here.
+
+The Dy sub-step turns out to contribute very little. `dy_sampling_step` fires on
+`if i // 2 == 1`, which at 40 steps means steps 2 and 3 — twice, out of forty. That is why
+Euler CFG++ and Euler Dy CFG++ land in the same place, and it is why an earlier version of
+this README was wrong to credit the half-resolution sub-step with the improvement.
+
+**Caveat on plain Euler Dy.** It looks clean, but `sd-forge-extra-samplers` computes
+`gamma = max(s_churn / (len(sigmas) - 1), 2**0.5 - 1)` — `max`, where every other sampler
+uses `min`. With the default `s_churn = 0` that pins gamma at 0.414 instead of 0, so it
+re-noises the latent at *every* step. The visible signature is exactly what you would
+expect: clean output, noticeably less fine detail, and a composition that diverges from
+every other sampler at the same seed. It is smoothing artifacts away rather than avoiding
+them. Prefer **Euler Dy CFG++**, which uses `min` and is unaffected.
+
+Rather than build sampler logic into this extension, the other fixes live where the
 problem is:
 
 * **CA fadeout start** (Advanced → Cross-attention). Tapers the downscale factor smoothly
@@ -122,8 +140,8 @@ problem is:
 * **The resolution gate** (below) keeps RAUNet out of the Dy samplers' rescaled sub-steps,
   where it would otherwise be correcting a latent that is already at native resolution.
 
-If you enable RAUNet with a late cutoff on a non-Dy sampler, the log says so once, with
-these suggestions. It never changes your settings.
+If you enable RAUNet with a late cutoff on a sampler that is neither CFG++ nor Dy, the log
+says so once, with these suggestions. It never changes your settings.
 
 ## The resolution gate
 
