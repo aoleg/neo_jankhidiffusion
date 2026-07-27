@@ -41,6 +41,17 @@ Both stop at their end percentage, after which the model runs completely unmodif
 Leave **Mode** on *Simple*, set **Resolution mode** to the band you are generating in, and
 generate. `Model type: auto` reads the family from the loaded checkpoint.
 
+**Model type** only chooses the *timing*. The block numbers always come from the model
+that is loaded — they are read off its structure at runtime, not looked up in a table — so
+a wrong Model type costs you a suboptimal schedule, never a broken configuration. The
+setting persists in `ui-config.json`, so if you pick a family once it stays picked; when it
+disagrees with the checkpoint the log says so, and every run reports which source the
+family came from:
+
+```
+RAUNet [first pass]: SDXL (from checkpoint), blocks [input3, output5] …
+```
+
 | Model | Resolution mode | What the preset does |
 |---|---|---|
 | SD1.5 | low | scaling blocks 0–40% |

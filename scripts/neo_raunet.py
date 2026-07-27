@@ -303,7 +303,7 @@ class NeoRAUNet(scripts.Script):
         return enable
 
     @staticmethod
-    def _settings(ui: dict, family: maps.ModelFamily | None) -> dict | None:
+    def _settings(ui: dict, family: maps.ModelFamily | None, unet_map=None) -> dict | None:
         """UI arguments -> the keyword arguments `Config.build` takes.
 
         Simple mode is a preset lookup that then goes through the exact same path as
@@ -311,11 +311,8 @@ class NeoRAUNet(scripts.Script):
         """
 
         if ui["mode"] == SIMPLE:
-            chosen = ui["model_type"]
-            if chosen != "auto":
-                family = maps.ModelFamily(chosen)
             if family is None:
-                logger.warning("RAUNet: could not identify the model family; pick one explicitly in the Simple tab")
+                logger.warning("RAUNet: could not identify the model family; pick one explicitly next to the Mode radio")
                 return None
 
             preset = maps.PRESETS[family]
@@ -328,17 +325,26 @@ class NeoRAUNet(scripts.Script):
                 logger.info(f"RAUNet: the {family} '{key}' preset is a no-op; that resolution is native for this model")
                 return None
 
+            #   Block numbers come from the loaded model, not from the family's table.  The
+            #   family only decides the *timing*: it is a guess (a dropdown, or a flag on
+            #   the checkpoint) and a wrong guess should cost a suboptimal schedule, not a
+            #   config full of another architecture's block numbers.
+            blocks = unet_map.default_blocks() if unet_map is not None else None
+            if blocks is None:
+                logger.warning("RAUNet: could not work out this model's scaling blocks")
+                return None
+
             #   `start >= end` is upstream's way of saying "this half is off"; blank the
             #   block lists rather than relying on an empty sigma window to do it, so the
             #   log line and the infotext both read the way the preset means
             start, end, ca_start, ca_end = window
             main_enabled = start < end
-            ca_on = ca_start < ca_end
+            ca_on = ca_start < ca_end and blocks["ca_input_blocks"]
             return {
-                "input_blocks": preset.input_blocks if main_enabled else "",
-                "output_blocks": preset.output_blocks if main_enabled else "",
-                "ca_input_blocks": preset.ca_input_blocks if ca_on else "",
-                "ca_output_blocks": preset.ca_output_blocks if ca_on else "",
+                "input_blocks": blocks["input_blocks"] if main_enabled else "",
+                "output_blocks": blocks["output_blocks"] if main_enabled else "",
+                "ca_input_blocks": blocks["ca_input_blocks"] if ca_on else "",
+                "ca_output_blocks": blocks["ca_output_blocks"] if ca_on else "",
                 "time_mode": "percent",
                 "start_time": start,
                 "end_time": end,
@@ -455,10 +461,16 @@ class NeoRAUNet(scripts.Script):
             logger.warning(f"RAUNet: not applied - {unet_map.reason}")
             return
 
+        detected, source = family, "checkpoint"
         if ui["model_type"] != "auto":
-            family = maps.ModelFamily(ui["model_type"])
+            family, source = maps.ModelFamily(ui["model_type"]), "Model type dropdown"
+            if detected is not None and family is not detected:
+                #   The dropdown persists in ui-config.json, so a value chosen during one
+                #   experiment silently governs every later run. Say so rather than quietly
+                #   applying the other architecture's schedule.
+                logger.warning(f"RAUNet: Model type is set to {family}, but this checkpoint looks like {detected}. Set it back to 'auto' unless you mean it")
 
-        settings = self._settings(ui, family)
+        settings = self._settings(ui, family, unet_map)
         if settings is None:
             return
 
@@ -478,7 +490,7 @@ class NeoRAUNet(scripts.Script):
         p.sd_model.forge_objects.unet = unet
         cls.configs.append(config)
 
-        self._report(p, settings, config, family, unet_map, is_hr)
+        self._report(p, settings, config, f'{family} (from {source})', unet_map, is_hr)
 
     @staticmethod
     def _gate_threshold(ui: dict, family) -> float:
@@ -495,7 +507,7 @@ class NeoRAUNet(scripts.Script):
         blocks = ", ".join(f"{t}{i}" for t, i in sorted(config.use_blocks)) or "none"
         ca_blocks = ", ".join(f"{t}{i}" for t, i in sorted(config.ca_use_blocks)) or "none"
         logger.info(
-            f"RAUNet [{pass_name}]: {family or 'unknown model'}, blocks [{blocks}] sigma {config.start_sigma:.4g}->{config.end_sigma:.4g}"
+            f"RAUNet [{pass_name}]: {family}, blocks [{blocks}] sigma {config.start_sigma:.4g}->{config.end_sigma:.4g}"
             f" | CA [{ca_blocks}] sigma {config.ca_start_sigma:.4g}->{config.ca_end_sigma:.4g} x{config.ca_downscale_factor:g} {config.ca_downscale_mode}"
             f" | skip below {config.min_megapixels:g}MP"
         )

@@ -78,6 +78,42 @@ class UNetMap:
         candidate = self.n_output_blocks - 1 - input_block
         return candidate if candidate in self.upsample_blocks else None
 
+    def default_blocks(self, *, after_skip: bool = False) -> dict | None:
+        """The blocks RAUNet should use on *this* model, derived rather than tabulated.
+
+        Every number in upstream's per-family tables falls out of the structure:
+
+          * the scaling pair is the shallowest `Downsample` and its mirror -
+            SD1.5 3/8 and SDXL 3/5;
+          * the cross-attention pair is the shallowest block that actually holds a
+            `SpatialTransformer` and *its* mirror - SD1.5 1/11 and SDXL 4/5.
+
+        Both reproduce the published tables exactly, so nothing is lost by deriving them,
+        and a misidentified model family can no longer produce block numbers that belong
+        to a different architecture.  The family is then only responsible for what it is
+        actually qualified to say: the time windows and the native resolution.
+        """
+
+        if not self.supported or not self.downsample_blocks:
+            return None
+
+        main_in = self.downsample_blocks[0]
+        main_out = self.paired_output(main_in)
+        if main_out is None:
+            return None
+
+        ca_in = self.ca_input_blocks[0] if self.ca_input_blocks else None
+        ca_out = None if ca_in is None else self.ca_paired_output(ca_in, after_skip=after_skip)
+        if ca_out is None or ca_out not in self.ca_output_blocks:
+            ca_in = ca_out = None
+
+        return {
+            "input_blocks": str(main_in),
+            "output_blocks": str(main_out),
+            "ca_input_blocks": "" if ca_in is None else str(ca_in),
+            "ca_output_blocks": "" if ca_out is None else str(ca_out),
+        }
+
     def validate(self, use_blocks, ca_use_blocks=(), *, after_skip: bool = False) -> list[str]:
         """Fatal complaints: configurations that would crash or silently do nothing.
 

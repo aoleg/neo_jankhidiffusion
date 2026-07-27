@@ -210,6 +210,10 @@ check(umap.paired_output(3) == 5, "input 3 pairs with output 5 on an SDXL-shaped
 check(umap.paired_output(6) == 2, "input 6 pairs with output 2")
 check(umap.paired_output(9) is None, "a nonexistent input block has no pair")
 
+derived = umap.default_blocks()
+check(derived == {"input_blocks": "3", "output_blocks": "5", "ca_input_blocks": "4", "ca_output_blocks": "5"}, f"SDXL block numbers derive from structure, got {derived}")
+check(maps.inspect_unet(None).default_blocks() is None, "an unsupported model derives nothing")
+
 check(umap.validate({("input", 3), ("output", 5)}) == [], "the canonical SDXL pairing validates")
 check(umap.validate({("input", 3)}), "an unpaired input block is rejected")
 check(umap.validate({("output", 5)}), "an unpaired output block is rejected")
@@ -615,20 +619,31 @@ DEFAULT_UI = {
 round_tripped = NeoRAUNet._named_args(tuple(DEFAULT_UI.values()))
 check(round_tripped == DEFAULT_UI, "the positional arg list and the key list stay in step")
 
+#   Reported: Simple mode on an SDXL checkpoint emitted input 3 / output 8 - SD1.5's block
+#   numbers - and was then refused with three complaints about block 8. The family had come
+#   from the Model type dropdown (which ui-config.json persists), and Simple mode trusted it
+#   for the *block numbers* rather than reading them off the model that was loaded.
+#   Whatever the family says now, the blocks must belong to this UNet.
+sdxl_map = maps.inspect_unet(make_unet())
 for family in (maps.ModelFamily.SD15, maps.ModelFamily.SDXL):
     for res in maps.RES_MODES:
         ui = dict(DEFAULT_UI, mode="Simple", model_type=str(family), res_mode=res)
-        settings = NeoRAUNet._settings(ui, family)
+        settings = NeoRAUNet._settings(ui, family, sdxl_map)
         if settings is None:
             check(family is maps.ModelFamily.SDXL and maps.res_mode_key(res) == "low", f"only SDXL 'low' resolves to nothing, not {family} {res}")
             continue
         cfg = Config.build(FakePredictor(), **settings, min_megapixels=0.0)
         check(cfg.use_blocks or cfg.ca_use_blocks, f"{family} {res} selects at least one half")
-        check(maps.inspect_unet(make_unet()).validate(cfg.use_blocks) == [] or family is maps.ModelFamily.SD15, f"{family} {res} block pairing is valid on an SDXL-shaped UNet")
+        problems = sdxl_map.validate(cfg.use_blocks, cfg.ca_use_blocks)
+        check(problems == [], f"{family} {res} is valid on the SDXL-shaped UNet it was given, got {problems}")
 
-sdxl_high = NeoRAUNet._settings(dict(DEFAULT_UI, model_type="SDXL", res_mode=maps.RES_MODES[1]), maps.ModelFamily.SDXL)
+mismatched = NeoRAUNet._settings(dict(DEFAULT_UI, mode="Simple", model_type="SD15", res_mode=maps.RES_MODES[0]), maps.ModelFamily.SD15, sdxl_map)
+check(mismatched["input_blocks"] == "3" and mismatched["output_blocks"] == "5", f"the reported case now yields SDXL blocks despite the SD15 family, got {mismatched['input_blocks']}/{mismatched['output_blocks']}")
+check(NeoRAUNet._settings(dict(DEFAULT_UI, mode="Simple"), maps.ModelFamily.SDXL, None) is None, "Simple mode declines rather than guessing when it has no model map")
+
+sdxl_high = NeoRAUNet._settings(dict(DEFAULT_UI, model_type="SDXL", res_mode=maps.RES_MODES[1]), maps.ModelFamily.SDXL, sdxl_map)
 check(sdxl_high["input_blocks"] == "" and sdxl_high["ca_input_blocks"] == "4", "SDXL 'high' is cross-attention only")
-sdxl_ultra = NeoRAUNet._settings(dict(DEFAULT_UI, model_type="SDXL", res_mode=maps.RES_MODES[2]), maps.ModelFamily.SDXL)
+sdxl_ultra = NeoRAUNet._settings(dict(DEFAULT_UI, model_type="SDXL", res_mode=maps.RES_MODES[2]), maps.ModelFamily.SDXL, sdxl_map)
 check(sdxl_ultra["input_blocks"] == "3" and sdxl_ultra["output_blocks"] == "5", "SDXL 'ultra' turns the scaling blocks back on")
 
 off = NeoRAUNet._settings(dict(DEFAULT_UI, mode="Advanced", ca_enabled=False), None)
@@ -709,6 +724,21 @@ log_records.clear()
 NeoRAUNet.configs = []
 script.process_before_every_sampling(FakeP(make_unet(), sampler_name="Euler Dy CFG++"), True, *ordered_args)
 check(not any("not one of the Dy" in msg for level, msg in log_records), "the sampler note stays quiet for a Dy sampler")
+
+#   Simple mode on an SDXL checkpoint with the dropdown stuck on SD15: it must say so, and
+#   it must still patch the blocks this model actually has
+log_records.clear()
+NeoRAUNet.configs = []
+simple_args = tuple(dict(DEFAULT_UI, mode="Simple", model_type="SD15", res_mode=maps.RES_MODES[2]).values())
+simple_p = FakeP(make_unet())
+script.process(simple_p, True, *simple_args)
+script.process_before_every_sampling(simple_p, True, *simple_args)
+check(any("looks like SDXL" in msg for level, msg in log_records if level == "warning"), "a Model type that disagrees with the checkpoint is called out")
+check(NeoRAUNet.configs and NeoRAUNet.configs[0].use_blocks == {("input", 3), ("output", 5)}, f"and the run still uses this model's blocks, got {NeoRAUNet.configs[0].use_blocks if NeoRAUNet.configs else None}")
+check(any("(from Model type dropdown)" in msg for level, msg in log_records if level == "info"), "the log says where the family came from")
+NeoRAUNet.active = False
+NeoRAUNet.resolved = {}
+NeoRAUNet.configs = []
 
 script.postprocess(fake_p, None, True, *ordered_args)
 check(not NeoRAUNet.active and NeoRAUNet.resolved == {} and NeoRAUNet.configs == [], "postprocess clears every scrap of state")
