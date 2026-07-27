@@ -139,9 +139,38 @@ reForge's Advanced tab therefore never looked good *because RAUNet behaved bette
 It looked good because its Dy samplers churn hard by default, and reForge blotches on
 non-Dy samplers for the same reason ours does.
 
-**So the scaling-block half needs a churning sampler, in either webui.** If you want it,
-use a sampler with churn — and note that `Neo_ExtraSchedulers`' CFG++ Dy ports use `min`
-where reForge uses `max`, so they run at gamma 0 and provide none.
+**So the scaling-block half needs a churning sampler, in either webui.** There are two
+ways to get one:
+
+* **`Euler Dy CFG++ (reForge)` / `Euler SMEA Dy CFG++ (reForge)`** in
+  [Neo_ExtraSchedulers](https://github.com/aoleg/Neo_ExtraSchedulers) — the reForge
+  behaviour reproduced as separate samplers, gamma pinned at 0.4142 with no configuration.
+  The plain `Euler Dy CFG++` / `Euler SMEA Dy CFG++` keep `min` and stay sharper.
+* **The `Sampler churn (s_churn)` slider** in this extension's Advanced tab, which works
+  with any sampler that accepts the parameter. See below.
+
+### Sampler churn (s_churn)
+
+Advanced → **Sampler churn (s_churn)**. `0` (the default) leaves your sampler completely
+alone; above 0, RAUNet sets `p.s_churn` for the run, so the sampler re-noises the latent to
+`sigma × (gamma + 1)` before each step and denoises it again. That is the same mechanism
+the reForge Dy samplers use, made available to any sampler that takes it.
+
+Gamma is `min(s_churn / (steps - 1), 0.4142)`, so at 40 steps you need `s_churn ≈ 16.6` to
+reach reForge's 0.4142. Start lower — a little churn goes a long way, and it trades fine
+detail for smoothness.
+
+Three things to know:
+
+* **It only reaches samplers that declare `s_churn`.** Euler, Heun, DPM2 and the CFG++/Dy
+  samplers do; DPM++ 2M and the ancestral solvers generally do not. If yours does not, the
+  log says so and nothing is changed.
+* **The global setting wins.** Forge's Settings → *sigma churn* is applied after this and
+  overrides it whenever it is non-zero (`sd_samplers_common.py:477-485`). Leave it at 0 —
+  the log warns if it is not.
+* **It composes with the (reForge) samplers rather than conflicting.** Those compute
+  `max(s_churn / (steps - 1), 0.4142)`, so the slider can only raise gamma above their
+  floor; setting it to 0 leaves them exactly as they are.
 
 ## Samplers
 
@@ -289,7 +318,7 @@ when shapes already match, and is left installed afterwards. Set
 
 ## X/Y/Z Plot
 
-Twenty axes are registered under `[RAUNet] …` — Enable, Mode, Model family, Resolution mode,
+Twenty-one axes are registered under `[RAUNet] …` — Enable, Mode, Model family, Resolution mode,
 the block lists, all the time windows, the fadeout, the downscale factor and mode, both
 upscale modes, and Min megapixels.
 

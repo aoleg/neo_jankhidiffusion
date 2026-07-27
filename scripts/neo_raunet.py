@@ -143,8 +143,10 @@ class NeoRAUNet(scripts.Script):
                     start_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="Start")
                     end_time = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.45, label="End", info="past this point the model runs unmodified")
                 with gr.Row():
-                    upscale_mode = gr.Dropdown(value="bicubic", choices=list(UPSCALE_METHODS), label="Upscale mode", info="bicubic or bislerp")
+                    upscale_mode = gr.Dropdown(value="bicubic", choices=list(UPSCALE_METHODS), label="Upscale mode", info="bicubic or bislerp; bislerp overshoots less on the 4x scaling-block upscale")
                     two_stage_upscale_mode = gr.Dropdown(value="disabled", choices=list(TWO_STAGE_METHODS), label="Two-stage upscale", info="do half the upscale with this mode first; different, not necessarily better")
+
+                sampler_churn = gr.Slider(minimum=0.0, maximum=20.0, step=0.1, value=0.0, label="Sampler churn (s_churn)", info="0 leaves your sampler alone. Above 0 it re-noises the latent each step, which is the mechanism that lets the scaling blocks work — see the README. Only affects samplers that accept s_churn, and the global 'sigma churn' setting overrides it")
 
                 with gr.Accordion(open=False, label="Cross-attention (off by default)"):
                     #   Off by default and behind a closed accordion because it is the
@@ -211,6 +213,7 @@ class NeoRAUNet(scripts.Script):
             (end_time, "RAUNet end"),
             (upscale_mode, "RAUNet upscale"),
             (two_stage_upscale_mode, "RAUNet two-stage upscale"),
+            (sampler_churn, "RAUNet sampler churn"),
             (ca_enabled, "RAUNet CA"),
             (ca_input_blocks, "RAUNet CA input blocks"),
             (ca_output_blocks, "RAUNet CA output blocks"),
@@ -240,6 +243,7 @@ class NeoRAUNet(scripts.Script):
             end_time,
             upscale_mode,
             two_stage_upscale_mode,
+            sampler_churn,
             ca_enabled,
             ca_input_blocks,
             ca_output_blocks,
@@ -297,6 +301,7 @@ class NeoRAUNet(scripts.Script):
             "end_time",
             "upscale_mode",
             "two_stage_upscale_mode",
+            "sampler_churn",
             "ca_enabled",
             "ca_input_blocks",
             "ca_output_blocks",
@@ -514,8 +519,58 @@ class NeoRAUNet(scripts.Script):
         install_controlnet_shim()
         p.sd_model.forge_objects.unet = unet
         cls.configs.append(config)
+        self._apply_sampler_churn(p, ui)
 
         self._report(p, settings, config, f'{family} (from {source})', unet_map, is_hr)
+
+    @staticmethod
+    def _apply_sampler_churn(p, ui: dict) -> None:
+        """Hand `s_churn` to the sampler for this run, if the user asked for one.
+
+        Churn - re-noising the latent to `sigma * (gamma + 1)` before each step and
+        denoising it again - is the mechanism that lets the scaling-block rewrite work:
+        the artifacts it introduces get annealed away instead of accumulating. reForge's
+        Dy samplers do this unconditionally, which is the whole reason its Advanced tab
+        looked better; this exposes the same lever for any sampler that accepts it.
+
+        The plumbing, verified against `modules/sd_samplers_common.py`:
+
+          * `p.s_churn` is a real field (`modules/processing.py:177`) and
+            `Sampler.initialize` copies it into the sampler's kwargs (`:466-468`) when the
+            sampler lists `s_churn` in `extra_params` *and* takes it as an argument;
+          * `:477` then reads `getattr(opts, "s_churn", p.s_churn)` and at `:482`
+            overwrites our value - **but only when the global setting is non-zero**, since
+            it compares against the sampler's own default of 0.0. So this works exactly as
+            long as Settings -> "sigma churn" is left at 0, which is the default.
+
+        `process_before_every_sampling` runs before `initialize` (`processing.py:1380` vs
+        `:1386`), so writing the attribute here is in time.
+        """
+
+        churn = float(ui.get("sampler_churn", 0.0) or 0.0)
+        if churn <= 0.0 or ui["mode"] != ADVANCED:
+            return
+
+        sampler = getattr(p, "sampler", None)
+        accepted = list(getattr(sampler, "extra_params", []) or [])
+        if sampler is not None and "s_churn" not in accepted:
+            logger.warning(f"RAUNet: sampler churn {churn:g} was requested, but '{getattr(p, 'sampler_name', '?')}' does not accept s_churn - ignoring it")
+            return
+
+        try:
+            from modules.shared import opts
+
+            global_churn = float(getattr(opts, "s_churn", 0.0) or 0.0)
+        except Exception:  # pragma: no cover - shared is always importable in the webui
+            global_churn = 0.0
+
+        if global_churn != 0.0:
+            logger.warning(f"RAUNet: sampler churn {churn:g} is being overridden by the global 'sigma churn' setting ({global_churn:g}); set that back to 0 to use this slider")
+            return
+
+        p.s_churn = churn
+        p.extra_generation_params["RAUNet sampler churn"] = churn
+        logger.info(f"RAUNet: sampler churn s_churn={churn:g} handed to '{getattr(p, 'sampler_name', '?')}'")
 
     @staticmethod
     def _gate_threshold(ui: dict, family) -> float:

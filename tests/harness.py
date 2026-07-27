@@ -587,6 +587,11 @@ def install_stubs():
     processing.logger = Logger()
     modules.processing = processing
 
+    shared = types.ModuleType("modules.shared")
+    shared.opts = types.SimpleNamespace(s_churn=0.0)
+    modules.shared = shared
+    sys.modules["modules.shared"] = shared
+
     ui_components = types.ModuleType("modules.ui_components")
     ui_components.InputAccordion = type("InputAccordion", (Component,), {})
     modules.ui_components = ui_components
@@ -624,6 +629,7 @@ DEFAULT_UI = {
     "end_time": 0.45,
     "upscale_mode": "bicubic",
     "two_stage_upscale_mode": "disabled",
+    "sampler_churn": 0.0,
     "ca_enabled": True,
     "ca_input_blocks": "4",
     "ca_output_blocks": "5",
@@ -737,6 +743,8 @@ class FakeP:
         self.extra_generation_params = {}
         self.sampler_name = sampler_name
         self.is_hr_pass = is_hr_pass
+        self.s_churn = 0.0
+        self.sampler = types.SimpleNamespace(extra_params=["s_churn", "s_tmin", "s_tmax", "s_noise"])
 
 
 script = NeoRAUNet()
@@ -789,6 +797,57 @@ ca_p.width, ca_p.height = 1792, 1792
 script.process(ca_p, True, *tuple(ca_only.values()))
 script.process_before_every_sampling(ca_p, True, *tuple(ca_only.values()))
 check(not any("only enables them above 2048" in msg for level, msg in log_records), "a cross-attention-only config is not flagged at 1792px")
+
+#   Sampler churn: `p.s_churn` is what `Sampler.initialize` reads, and it is only honoured
+#   while the global "sigma churn" setting is 0 - see `_apply_sampler_churn`.
+import modules.shared as stub_shared
+
+log_records.clear()
+NeoRAUNet.configs = []
+churn_ui = dict(DEFAULT_UI, mode="Advanced", model_type="SDXL", sampler_churn=3.0)
+churn_args = tuple(churn_ui.values())
+churn_p = FakeP(make_unet())
+script.process(churn_p, True, *churn_args)
+script.process_before_every_sampling(churn_p, True, *churn_args)
+check(churn_p.s_churn == 3.0, f"churn reaches p.s_churn, got {churn_p.s_churn}")
+check(churn_p.extra_generation_params.get("RAUNet sampler churn") == 3.0, "and is recorded in the infotext")
+
+log_records.clear()
+NeoRAUNet.configs = []
+zero_p = FakeP(make_unet())
+script.process(zero_p, True, *tuple(dict(churn_ui, sampler_churn=0.0).values()))
+script.process_before_every_sampling(zero_p, True, *tuple(dict(churn_ui, sampler_churn=0.0).values()))
+check(zero_p.s_churn == 0.0 and "RAUNet sampler churn" not in zero_p.extra_generation_params, "0 leaves the sampler alone entirely")
+
+log_records.clear()
+NeoRAUNet.configs = []
+plain_p = FakeP(make_unet())
+plain_p.sampler = types.SimpleNamespace(extra_params=[])
+script.process(plain_p, True, *churn_args)
+script.process_before_every_sampling(plain_p, True, *churn_args)
+check(plain_p.s_churn == 0.0, "a sampler that does not accept s_churn is left untouched")
+check(any("does not accept s_churn" in msg for level, msg in log_records if level == "warning"), "and it says so")
+
+log_records.clear()
+NeoRAUNet.configs = []
+stub_shared.opts.s_churn = 1.5
+global_p = FakeP(make_unet())
+script.process(global_p, True, *churn_args)
+script.process_before_every_sampling(global_p, True, *churn_args)
+check(global_p.s_churn == 0.0, "a non-zero global 'sigma churn' wins, and we do not pretend otherwise")
+check(any("overridden by the global" in msg for level, msg in log_records if level == "warning"), "and that is reported")
+stub_shared.opts.s_churn = 0.0
+
+log_records.clear()
+NeoRAUNet.configs = []
+simple_churn = tuple(dict(DEFAULT_UI, mode="Simple", model_type="SDXL", res_mode=maps.RES_MODES[2], sampler_churn=3.0).values())
+simple_p = FakeP(make_unet())
+script.process(simple_p, True, *simple_churn)
+script.process_before_every_sampling(simple_p, True, *simple_churn)
+check(simple_p.s_churn == 0.0, "the churn slider is an Advanced control and does not leak into Simple")
+NeoRAUNet.active = False
+NeoRAUNet.resolved = {}
+NeoRAUNet.configs = []
 NeoRAUNet.active = False
 NeoRAUNet.resolved = {}
 NeoRAUNet.configs = []
